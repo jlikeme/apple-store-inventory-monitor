@@ -4,7 +4,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { saveSettings } from "@/lib/store";
+import { saveBarkOptions } from "@/lib/store";
 import type { BarkLevel, BarkOptions } from "@/lib/types";
 
 /** Bark App 内置铃声（与 Bark 仓库 Sounds 目录一致）。 */
@@ -38,7 +38,7 @@ export function BarkPushSettings({ options }: { options: BarkOptions }) {
   useEffect(() => setVolume(options.volume === null ? "" : String(options.volume)), [options.volume]);
 
   const save = (patch: Partial<BarkOptions>) =>
-    void saveSettings({ barkOptions: { ...options, ...patch } });
+    void saveBarkOptions(patch);
 
   return (
     <div className="mt-3 space-y-3 rounded-xl border border-border/55 bg-background/30 p-3">

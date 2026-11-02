@@ -29,7 +29,9 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::browser_support::startup_exit_detail;
+#[cfg(test)]
 use crate::clash::ClashController;
+use crate::proxy_controller::{MAX_NODE_DELAY_MS, NodeProbe, ProxyController};
 use crate::route_pool::RoutePool;
 
 const CHROME_START_TIMEOUT: Duration = Duration::from_secs(12);
@@ -45,6 +47,7 @@ const CHROMIUM_PROFILE_DIR: &str = "chromium-profile-v1";
 const SESSION_ESTABLISHED_MARKER: &str = ".apple-session-established";
 const PAGE_FETCH_FAILURE_MARKER: &str = "__APW_PAGE_FETCH_FAILED__:";
 const PAGE_FETCH_FAILURE_PREFIX: &str = "Apple 页面请求失败：";
+const MAX_CONSECUTIVE_PAGE_FETCH_FAILURES: u32 = 2;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -82,6 +85,8 @@ pub(crate) struct ChromiumSession {
     profile_dir: PathBuf,
     socket: Socket,
     next_command_id: u64,
+    /// Remains true if a command future was cancelled before its response.
+    command_pending: bool,
     locale: Option<&'static str>,
     established: bool,
 }
@@ -269,14 +274,14 @@ fn save_startup_diagnostic(profile: &Path, browser: &Path, mode: &str, result: &
 
 /// 查询浏览器的网络启动参数。
 ///
-/// 跟随系统代理时不加参数，与引入线路设置之前完全一致。Clash 模式只让这个
+/// 跟随系统代理时不加参数，与引入线路设置之前完全一致。代理节点模式只让这个
 /// 浏览器走专用端口，不改变系统代理。
 fn chromium_network_args(network: &NetworkSettings) -> Vec<String> {
     match network.mode {
         NetworkMode::System => Vec::new(),
         NetworkMode::Pinned | NetworkMode::Clash => vec![format!(
             "--proxy-server=http://127.0.0.1:{}",
-            network.clash.proxy_port
+            network.proxy_port()
         )],
     }
 }
@@ -658,6 +663,7 @@ impl ChromiumSession {
             profile_dir,
             socket,
             next_command_id: 1,
+            command_pending: false,
             locale: None,
             established,
         };
@@ -712,6 +718,7 @@ impl ChromiumSession {
         let id = self.next_command_id;
         self.next_command_id = self.next_command_id.wrapping_add(1).max(1);
         let request = json!({ "id": id, "method": method, "params": params });
+        self.command_pending = true;
         tokio::time::timeout(
             COMMAND_TIMEOUT,
             self.socket.send(Message::Text(request.to_string().into())),
@@ -742,9 +749,11 @@ impl ChromiumSession {
             Err(ApiError::Transport("Chromium 调试连接意外关闭".into()))
         };
 
-        tokio::time::timeout(COMMAND_TIMEOUT, wait)
+        let result = tokio::time::timeout(COMMAND_TIMEOUT, wait)
             .await
-            .map_err(|_| ApiError::Transport(format!("Chromium 命令 {method} 超时")))?
+            .map_err(|_| ApiError::Transport(format!("Chromium 命令 {method} 超时")))?;
+        self.command_pending = false;
+        result
     }
 
     pub(crate) async fn evaluate(
@@ -1275,6 +1284,7 @@ fn find_chromium() -> Option<PathBuf> {
 pub struct RouteList {
     pub now: Option<String>,
     pub nodes: Vec<RouteInfo>,
+    pub probe_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1283,6 +1293,8 @@ pub struct RouteInfo {
     pub name: String,
     /// 批量测速延迟（毫秒）；超时或 DIRECT 为 `None`。
     pub delay: Option<u32>,
+    /// None means the test could not be completed, not an unreachable node.
+    pub reachable: Option<bool>,
     /// 是否因被 Apple 拒绝而冷却，或暂时连不通。
     pub resting: bool,
 }
@@ -1432,9 +1444,16 @@ impl CyclePickupRejection {
 #[derive(Debug, Default)]
 struct QueryState {
     session: Option<ChromiumSession>,
+    #[cfg(test)]
+    test_sessions: Option<std::collections::VecDeque<ChromiumSession>>,
     /// 本轮启动浏览器会话失败后不再为每个门店重复启动。
     /// 新一轮会清空并再次尝试，重试节奏仍由用户设置决定。
     session_start_failure: Option<String>,
+    /// 只统计实际取货请求的连续页面 fetch 失败，跨轮次保留以覆盖单门店监控。
+    /// 新会话或收到 HTTP 响应后清零，不把缓存复用计作一次成功请求。
+    consecutive_page_fetch_failures: u32,
+    /// 页面请求失败导致的重建每轮最多一次，避免网络持续故障时反复启动浏览器。
+    page_fetch_recovery_attempted: bool,
     pickup_cache: HashMap<PickupCacheKey, String>,
     nearby_parts: HashMap<PickupCacheKey, Vec<String>>,
     /// 本轮已经证实无法用于批量查询的地点。后续同地点门店直接按编号查询，
@@ -1459,12 +1478,12 @@ struct QueryState {
     gate: RequestGate,
     cycle_reused_response_count: u32,
     network: NetworkSettings,
-    /// Clash 模式下的控制接口；地址无效时保存错误原因。
-    clash: Option<Result<ClashController, String>>,
+    /// 代理节点模式下的控制接口；地址无效时保存错误原因。
+    controller: Option<Result<ProxyController, String>>,
     routes: RoutePool,
-    /// 本轮是否已从 Clash 读取节点列表。每轮重读一次，跟上用户在 Clash 里的改动。
+    /// 本轮是否已从代理软件读取节点列表。每轮重读一次，跟上用户在代理软件里的改动。
     routes_loaded: bool,
-    /// 本轮 Clash 控制接口的故障，同轮不再重复访问。
+    /// 本轮代理控制接口的故障，同轮不再重复访问。
     route_failure: Option<String>,
     route_switches: u32,
     /// 本轮连续被 Apple 拒绝的节点数，拿到正常响应后清零。
@@ -1473,13 +1492,17 @@ struct QueryState {
     dead_routes: HashSet<String>,
     /// 订阅节点所属的订阅名，用于切换前测速。
     route_providers: HashMap<String, String>,
+    /// Retest the active and candidate nodes once per cycle.
+    route_probes: HashMap<String, NodeProbe>,
     /// 已经提示过「全部节点冷却」的站点，避免同一次冷却反复弹出告警。
     cooling_announced: HashSet<String>,
 }
 
 impl QueryState {
     fn begin_cycle(&mut self) {
+        self.route_probes.clear();
         self.session_start_failure = None;
+        self.page_fetch_recovery_attempted = false;
         self.pickup_cache.clear();
         self.nearby_parts.clear();
         self.unavailable_nearby.clear();
@@ -1517,14 +1540,14 @@ impl QueryState {
     fn needs_delivery(&self, target: &Target, location: &DeliveryRegion) -> bool {
         let key = DeliveryCacheKey::new(target, location);
         !self.delivery_attempts.contains(&key)
-            && !self
+            && self
                 .delivery_cache
                 .get(&key)
-                .is_some_and(|entry| entry.fetched_at.elapsed() < DELIVERY_CACHE_TTL)
-            && !self
+                .is_none_or(|entry| entry.fetched_at.elapsed() >= DELIVERY_CACHE_TTL)
+            && self
                 .empty_delivery_cache
                 .get(&key)
-                .is_some_and(|entry| entry.fetched_at.elapsed() < EMPTY_DELIVERY_CACHE_TTL)
+                .is_none_or(|entry| entry.fetched_at.elapsed() >= EMPTY_DELIVERY_CACHE_TTL)
     }
 
     fn cache_delivery(
@@ -1536,10 +1559,10 @@ impl QueryState {
         let key = DeliveryCacheKey::new(target, location);
         // 空响应只延后五分钟重试，不覆盖已有日期，也不延长已有日期的有效期。
         // 明确的“暂无供应”有送货文案，正常替换旧日期并缓存一小时。
-        if !info
+        if info
             .sale_message
             .as_deref()
-            .is_some_and(|message| !message.trim().is_empty())
+            .is_none_or(|message| message.trim().is_empty())
         {
             self.empty_delivery_cache.insert(
                 key,
@@ -1588,7 +1611,7 @@ impl QueryState {
     fn route_summary(&self) -> Option<String> {
         match self.network.mode {
             NetworkMode::System => None,
-            NetworkMode::Pinned => Some(format!("指定节点 {}", self.network.clash.pinned_node)),
+            NetworkMode::Pinned => Some(format!("指定节点 {}", self.network.pinned_node())),
             NetworkMode::Clash => Some(if let Some(failure) = &self.route_failure {
                 failure.clone()
             } else {
@@ -1601,9 +1624,13 @@ impl QueryState {
                     notes.push(format!("跳过 {} 个连不通的节点", self.dead_routes.len()));
                 }
                 if notes.is_empty() {
-                    format!("Clash 节点 {node}")
+                    format!("{} 节点 {node}", self.network.backend.label())
                 } else {
-                    format!("Clash 节点 {node}（{}）", notes.join("，"))
+                    format!(
+                        "{} 节点 {node}（{}）",
+                        self.network.backend.label(),
+                        notes.join("，")
+                    )
                 }
             }),
         }
@@ -1613,63 +1640,131 @@ impl QueryState {
     fn route_label(&self) -> String {
         match self.network.mode {
             NetworkMode::System => "系统代理".into(),
-            NetworkMode::Pinned => format!("指定节点 {}", self.network.clash.pinned_node),
+            NetworkMode::Pinned => format!("指定节点 {}", self.network.pinned_node()),
             NetworkMode::Clash => {
-                format!("Clash 节点 {}", self.routes.active().unwrap_or("尚未选定"))
+                format!(
+                    "{} 节点 {}",
+                    self.network.backend.label(),
+                    self.routes.active().unwrap_or("尚未选定")
+                )
             }
         }
     }
 
     fn set_network(&mut self, network: NetworkSettings) {
-        let uses_clash = matches!(network.mode, NetworkMode::Pinned | NetworkMode::Clash);
-        if self.network == network && self.clash.is_some() == uses_clash {
+        let uses_proxy = matches!(network.mode, NetworkMode::Pinned | NetworkMode::Clash);
+        if self.network == network && self.controller.is_some() == uses_proxy {
             return;
         }
-        if chromium_network_args(&self.network) != chromium_network_args(&network) {
-            // 代理参数只能在启动 Chromium 时指定，换线路方式必须重启浏览器。
+        let backend_changed = self.network.backend != network.backend;
+        if chromium_network_args(&self.network) != chromium_network_args(&network)
+            || (uses_proxy && backend_changed)
+        {
             self.session = None;
             self.session_start_failure = None;
         }
-        // 只改指定节点不影响轮换模式积累的冷却记录。
-        let pool_settings = |clash: &apw_core::config::ClashSettings| {
-            (
-                clash.controller.clone(),
-                clash.group.clone(),
-                clash.node_filter.clone(),
-            )
-        };
-        if pool_settings(&self.network.clash) != pool_settings(&network.clash) {
+        // Cooling is scoped to the backend, controller and group. Editing the
+        // inactive backend or the pinned node must not erase active cooldowns.
+        if backend_changed
+            || self.network.controller() != network.controller()
+            || self.network.group() != network.group()
+            || self.network.node_filter() != network.node_filter()
+        {
             self.routes = RoutePool::default();
             self.dead_routes.clear();
+            self.route_providers.clear();
             self.cooling_announced.clear();
+            self.consecutive_rejections = 0;
         }
-        self.clash = uses_clash.then(|| ClashController::new(&network.clash));
+        self.route_probes.clear();
+        self.controller = uses_proxy.then(|| ProxyController::new(&network));
         self.network = network;
         self.routes_loaded = false;
         self.route_failure = None;
     }
 
-    /// 是否处于自动切换节点的轮换模式。指定节点模式只固定使用一个节点。
-    fn rotating(&self) -> bool {
-        self.network.mode == NetworkMode::Clash && self.clash.is_some()
-    }
-
-    fn clash_controller(&self) -> Result<ClashController, String> {
-        match &self.clash {
-            None => Err("当前查询线路没有使用 Clash".into()),
-            Some(Err(error)) => Err(error.clone()),
-            Some(Ok(clash)) => Ok(clash.clone()),
+    fn route_changed(&mut self, controller: &ProxyController) {
+        if controller.restarts_session() {
+            self.session = None;
+            self.session_start_failure = None;
+        } else if let Some(session) = self.session.as_mut() {
+            session.locale = None;
         }
     }
 
-    /// 从 Clash 重新读取节点列表，以 Clash 的实际选择为当前节点。
-    async fn reload_routes(&mut self, clash: &ClashController) -> Result<(), String> {
-        let group = self.network.clash.group.clone();
-        let nodes = clash
-            .group_nodes(&group, &self.network.clash.node_filter)
+    async fn ensure_session(&mut self, profile_dir: &Path) -> Result<(), ApiError> {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.command_pending)
+        {
+            self.session = None;
+        }
+        if self.session.is_some() {
+            return Ok(());
+        }
+        if let Some(detail) = &self.session_start_failure {
+            return Err(ApiError::BrowserUnavailable(detail.clone()));
+        }
+        let result = self.start_session(profile_dir).await;
+        match result {
+            Ok(session) => {
+                self.session = Some(session);
+                self.consecutive_page_fetch_failures = 0;
+                Ok(())
+            }
+            Err(error) => {
+                let detail = match &error {
+                    ApiError::Transport(detail) | ApiError::BrowserUnavailable(detail) => {
+                        detail.clone()
+                    }
+                    _ => error.to_string(),
+                };
+                self.session_start_failure = Some(detail);
+                Err(error)
+            }
+        }
+    }
+
+    async fn start_session(&mut self, profile_dir: &Path) -> Result<ChromiumSession, ApiError> {
+        #[cfg(test)]
+        if let Some(sessions) = self.test_sessions.as_mut() {
+            return sessions
+                .pop_front()
+                .ok_or_else(|| ApiError::BrowserUnavailable("模拟浏览器启动失败".into()));
+        }
+        ChromiumSession::start_with_args(
+            profile_dir.to_path_buf(),
+            &chromium_network_args(&self.network),
+        )
+        .await
+    }
+
+    /// 是否处于自动切换节点的轮换模式。指定节点模式只固定使用一个节点。
+    fn rotating(&self) -> bool {
+        self.network.mode == NetworkMode::Clash && self.controller.is_some()
+    }
+
+    fn proxy_controller(&self) -> Result<ProxyController, String> {
+        match &self.controller {
+            None => Err("当前查询线路未启用代理节点管理".into()),
+            Some(Err(error)) => Err(error.clone()),
+            Some(Ok(controller)) => Ok(controller.clone()),
+        }
+    }
+
+    /// 从代理软件重新读取节点列表，以其实际选择为当前节点。
+    async fn reload_routes(&mut self, controller: &ProxyController) -> Result<(), String> {
+        let group = self.network.group().to_string();
+        let nodes = controller
+            .group_nodes(&group, self.network.node_filter())
             .await?;
         if nodes.nodes.is_empty() {
             return Err(format!("策略组「{group}」里没有可用于查询的节点"));
+        }
+        // Compare before overwriting active: users can also switch in Surge.
+        if controller.restarts_session() && self.routes.active() != nodes.now.as_deref() {
+            self.route_changed(controller);
         }
         self.route_providers = nodes.providers;
         self.routes.set_routes(nodes.nodes);
@@ -1679,27 +1774,39 @@ impl QueryState {
     }
 
     /// 用户手动指定节点：立即切换并解除该节点的冷却，自动切换规则继续生效。
-    /// 返回切换前的测速结果；DIRECT 或测速失败时为 `None`，但仍按用户意愿切换。
-    async fn select_route_manually(&mut self, node: &str) -> Result<Option<u32>, String> {
-        let clash = self.clash_controller()?;
+    /// 返回连通性与可选延迟；明确不可达时仍按用户意愿切换，控制接口异常则报错。
+    async fn select_route_manually(&mut self, node: &str) -> Result<NodeProbe, String> {
+        let controller = self.proxy_controller()?;
         if !self.routes.routes().iter().any(|route| route == node) {
-            self.reload_routes(&clash).await?;
+            self.reload_routes(&controller).await?;
         }
         if !self.routes.routes().iter().any(|route| route == node) {
             return Err(format!("节点「{node}」不在策略组中，或被节点关键词排除"));
         }
-        let delay = if node == "DIRECT" {
-            None
+        let probe = if node == "DIRECT" {
+            NodeProbe {
+                reachable: true,
+                delay_ms: None,
+            }
         } else {
             let provider = self.route_providers.get(node).map(String::as_str);
-            clash.node_delay(node, provider).await.ok()
+            controller.node_probe(node, provider).await?
         };
-        let group = self.network.clash.group.clone();
-        clash
-            .select(&group, node)
-            .await
-            .map_err(|error| format!("切换 Clash 节点失败：{error}"))?;
-        if let Err(error) = clash.close_group_connections(&group).await {
+        if probe.too_slow() {
+            return Err(format!(
+                "节点「{node}」延迟 {} ms，超过 {MAX_NODE_DELAY_MS} ms，未切换",
+                probe.delay_ms.unwrap()
+            ));
+        }
+        self.route_probes.insert(node.to_string(), probe);
+        let group = self.network.group().to_string();
+        let selection = controller.select(&group, node).await;
+        if controller.restarts_session() {
+            self.route_changed(&controller);
+            self.routes_loaded = false;
+        }
+        selection.map_err(|error| format!("切换 {} 节点失败：{error}", controller.label()))?;
+        if let Err(error) = controller.close_group_connections(&group).await {
             eprintln!("手动切换节点后断开旧连接失败：{error}");
         }
         self.routes.clear_route(node);
@@ -1708,35 +1815,55 @@ impl QueryState {
         self.consecutive_rejections = 0;
         self.cooling_announced.clear();
         self.route_failure = None;
-        if let Some(session) = self.session.as_mut() {
-            session.locale = None;
-        }
-        eprintln!("手动切换到 Clash 节点 {node}");
-        Ok(delay)
+        self.route_changed(&controller);
+        eprintln!("手动切换到 {} 节点 {node}", controller.label());
+        Ok(probe)
     }
 
-    /// Clash 模式下，在真实请求前确认出口节点：必要时切换节点、断开旧连接，
+    async fn probe_route(
+        &mut self,
+        controller: &ProxyController,
+        node: &str,
+    ) -> Result<NodeProbe, String> {
+        if let Some(probe) = self.route_probes.get(node) {
+            return Ok(*probe);
+        }
+        let probe = if node == "DIRECT" {
+            NodeProbe {
+                reachable: true,
+                delay_ms: None,
+            }
+        } else {
+            controller
+                .node_probe(node, self.route_providers.get(node).map(String::as_str))
+                .await?
+        };
+        self.route_probes.insert(node.to_string(), probe);
+        Ok(probe)
+    }
+
+    /// 代理节点模式下，在真实请求前确认出口节点：必要时切换节点、断开旧连接，
     /// 并让浏览器在新出口上重新打开地区页面完成校验。
     async fn prepare_route(&mut self, region: &'static Region) -> Result<(), ApiError> {
-        let clash = match &self.clash {
+        let controller = match &self.controller {
             None => return Ok(()),
             Some(Err(error)) => return Err(ApiError::Transport(error.clone())),
-            Some(Ok(clash)) => clash.clone(),
+            Some(Ok(controller)) => controller.clone(),
         };
         if let Some(failure) = &self.route_failure {
             return Err(ApiError::Transport(failure.clone()));
         }
-        let group = self.network.clash.group.clone();
+        let group = self.network.group().to_string();
         if !self.routes_loaded
-            && let Err(error) = self.reload_routes(&clash).await
+            && let Err(error) = self.reload_routes(&controller).await
         {
-            let failure = format!("Clash 线路不可用：{error}");
+            let failure = format!("{} 线路不可用：{error}", controller.label());
             self.route_failure = Some(failure.clone());
             return Err(ApiError::Transport(failure));
         }
 
         if self.network.mode == NetworkMode::Pinned {
-            return self.apply_pinned_route(&clash).await;
+            return self.apply_pinned_route(&controller).await;
         }
 
         let site = region_site(region);
@@ -1761,16 +1888,15 @@ impl QueryState {
                     remaining_seconds: remaining.as_secs()
                         + u64::from(remaining.subsec_nanos() > 0),
                     detail: format!(
-                        "策略组「{group}」的 {} 个节点都被 Apple 拒绝或暂时连不通，正在等待",
+                        "策略组「{group}」的 {} 个节点被 Apple 拒绝、连不通或延迟超过 {MAX_NODE_DELAY_MS} ms，正在等待",
                         self.routes.routes().len()
                     ),
                     newly_started: self.cooling_announced.insert(site),
                 });
             };
-            if self.routes.active() == Some(candidate.as_str()) {
-                return Ok(());
-            }
-            if self.consecutive_rejections >= MAX_CONSECUTIVE_REJECTIONS {
+            if self.routes.active() != Some(candidate.as_str())
+                && self.consecutive_rejections >= MAX_CONSECUTIVE_REJECTIONS
+            {
                 return Err(ApiError::Blocked(format!(
                     "连续 {MAX_CONSECUTIVE_REJECTIONS} 个节点都被 Apple 拒绝，可能不只是 IP 问题，本轮暂停切换"
                 )));
@@ -1779,63 +1905,94 @@ impl QueryState {
             if candidate == "DIRECT" {
                 break candidate;
             }
-            let provider = self.route_providers.get(&candidate).map(String::as_str);
-            match clash.node_delay(&candidate, provider).await {
-                Ok(delay) => {
-                    eprintln!("Clash 节点 {candidate} 测速 {delay} ms");
+            match self.probe_route(&controller, &candidate).await {
+                Ok(probe) if probe.usable() => {
+                    eprintln!(
+                        "{} 节点 {candidate} 可达，延迟 {:?} ms",
+                        controller.label(),
+                        probe.delay_ms
+                    );
                     break candidate;
                 }
-                Err(error) => {
-                    eprintln!("Clash 节点 {candidate} {error}，跳过");
+                Ok(probe) => {
+                    if probe.too_slow() {
+                        eprintln!(
+                            "{} 节点 {candidate} 延迟 {} ms 超过 {MAX_NODE_DELAY_MS} ms，跳过 60 秒",
+                            controller.label(),
+                            probe.delay_ms.unwrap()
+                        );
+                    }
                     self.routes.mark_unreachable(&candidate, Instant::now());
                     self.dead_routes.insert(candidate);
+                }
+                Err(error) => {
+                    self.route_failure = Some(error.clone());
+                    return Err(ApiError::Transport(error));
                 }
             }
         };
 
-        clash
-            .select(&group, &chosen)
-            .await
-            .map_err(|error| ApiError::Transport(format!("切换 Clash 节点失败：{error}")))?;
-        match clash.close_group_connections(&group).await {
-            Ok(closed) => eprintln!("Apple 查询切换到 Clash 节点 {chosen}，断开旧连接 {closed} 条"),
+        if self.routes.active() == Some(chosen.as_str()) {
+            return Ok(());
+        }
+        controller.select(&group, &chosen).await.map_err(|error| {
+            ApiError::Transport(format!("切换 {} 节点失败：{error}", controller.label()))
+        })?;
+        match controller.close_group_connections(&group).await {
+            Ok(closed) => eprintln!(
+                "Apple 查询切换到 {} 节点 {chosen}，断开旧连接 {closed} 条",
+                controller.label()
+            ),
             Err(error) => {
-                eprintln!("Apple 查询切换到 Clash 节点 {chosen}，但断开旧连接失败：{error}")
+                eprintln!(
+                    "Apple 查询切换到 {} 节点 {chosen}，但断开旧连接失败：{error}",
+                    controller.label()
+                )
             }
         }
         self.routes.set_active(Some(chosen));
         self.route_switches = self.route_switches.saturating_add(1);
-        if let Some(session) = self.session.as_mut() {
-            // 新出口需要重新打开地区页面，让 Apple 的页面校验在新 IP 上完成。
-            session.locale = None;
-        }
+        self.route_changed(&controller);
         Ok(())
     }
 
-    /// 指定节点模式：确保 Clash 专用组选中用户指定的节点，不做测速和自动切换。
-    async fn apply_pinned_route(&mut self, clash: &ClashController) -> Result<(), ApiError> {
-        let node = self.network.clash.pinned_node.clone();
-        if self.routes.active() == Some(node.as_str()) {
-            return Ok(());
-        }
+    /// 指定模式同样检查延迟；不符合条件时报错，不自动切换到其他节点。
+    async fn apply_pinned_route(&mut self, controller: &ProxyController) -> Result<(), ApiError> {
+        let node = self.network.pinned_node().to_string();
         if !self.routes.routes().contains(&node) {
             let failure = format!("指定节点「{node}」不在策略组中，或被节点关键词排除");
             self.route_failure = Some(failure.clone());
             return Err(ApiError::Transport(failure));
         }
-        let group = self.network.clash.group.clone();
-        clash
-            .select(&group, &node)
+        let probe = self
+            .probe_route(controller, &node)
             .await
-            .map_err(|error| ApiError::Transport(format!("切换 Clash 节点失败：{error}")))?;
-        if let Err(error) = clash.close_group_connections(&group).await {
+            .map_err(ApiError::Transport)?;
+        if !probe.usable() {
+            let failure = if probe.too_slow() {
+                format!(
+                    "指定节点「{node}」延迟 {} ms，超过 {MAX_NODE_DELAY_MS} ms，已停止使用该节点查询",
+                    probe.delay_ms.unwrap()
+                )
+            } else {
+                format!("指定节点「{node}」测速不可达，已停止使用该节点查询")
+            };
+            self.route_failure = Some(failure.clone());
+            return Err(ApiError::Transport(failure));
+        }
+        if self.routes.active() == Some(node.as_str()) {
+            return Ok(());
+        }
+        let group = self.network.group().to_string();
+        controller.select(&group, &node).await.map_err(|error| {
+            ApiError::Transport(format!("切换 {} 节点失败：{error}", controller.label()))
+        })?;
+        if let Err(error) = controller.close_group_connections(&group).await {
             eprintln!("切换到指定节点后断开旧连接失败：{error}");
         }
         eprintln!("Apple 查询使用指定节点 {node}");
         self.routes.set_active(Some(node));
-        if let Some(session) = self.session.as_mut() {
-            session.locale = None;
-        }
+        self.route_changed(controller);
         Ok(())
     }
 
@@ -1851,7 +2008,8 @@ impl QueryState {
         let cooldown = self.routes.block(&active, &site, Instant::now());
         self.consecutive_rejections = self.consecutive_rejections.saturating_add(1);
         eprintln!(
-            "Clash 节点 {active} 在 {site} 被 Apple 拒绝，冷却 {} 分钟",
+            "{} 节点 {active} 在 {site} 被 Apple 拒绝，冷却 {} 分钟",
+            self.network.backend.label(),
             cooldown.as_secs().div_ceil(60)
         );
         self.can_switch_route(region)
@@ -1866,12 +2024,15 @@ impl QueryState {
             return false;
         };
         self.routes.mark_unreachable(&active, Instant::now());
-        eprintln!("Clash 节点 {active} 连不通，暂时跳过");
-        self.dead_routes.insert(active);
+        self.dead_routes.insert(active.clone());
+        eprintln!(
+            "{} 节点 {active} 连不通，暂时跳过",
+            self.network.backend.label()
+        );
         self.can_switch_route(region)
     }
 
-    /// Clash 模式下本轮是否还能换到另一个节点。
+    /// 代理节点模式下本轮是否还能换到另一个节点。
     fn can_switch_route(&self, region: &'static Region) -> bool {
         self.rotating()
             && self.consecutive_rejections < MAX_CONSECUTIVE_REJECTIONS
@@ -1893,20 +2054,21 @@ impl QueryState {
         self.cooling_announced.remove(&site);
     }
 
-    /// 发出一次取货请求。Clash 模式下被拒或连不通时换节点继续，直到拿到结果、
+    /// 发出一次取货请求。代理节点模式下被拒或连不通时换节点继续，直到拿到结果、
     /// 没有可用节点或连续被拒达到上限。
     async fn fetch_pickup(
         &mut self,
         region: &'static Region,
         scope: &PickupScope,
         parts: &[String],
+        profile_dir: &Path,
     ) -> Result<BrowserPayload, ApiError> {
-        // 每次重试都会让一个节点进入冷却或短暂跳过，节点数就是天然上限；
-        // 再加一道保险，防止短暂跳过到期后在同一请求里无限循环。节点列表在
-        // `prepare_route` 里才加载，上限必须在它之后按最新节点数计算。
+        // 换节点的重试次数受节点数限制，页面 fetch 的会话恢复另限每轮一次。
+        // 节点列表在 `prepare_route` 里才加载，上限必须在它之后按最新节点数计算。
         let mut attempts = 0usize;
         loop {
             self.prepare_route(region).await?;
+            self.ensure_session(profile_dir).await?;
             let result = {
                 let QueryState { session, gate, .. } = &mut *self;
                 session
@@ -1917,6 +2079,28 @@ impl QueryState {
             };
             attempts += 1;
             let result = result.map_err(|error| self.explain_proxy_error(error));
+            if matches!(&result, Ok(payload)
+                if payload.status == 0 && payload.body.starts_with(PAGE_FETCH_FAILURE_MARKER))
+            {
+                self.consecutive_page_fetch_failures =
+                    self.consecutive_page_fetch_failures.saturating_add(1);
+                if self.consecutive_page_fetch_failures >= MAX_CONSECUTIVE_PAGE_FETCH_FAILURES
+                    && !self.page_fetch_recovery_attempted
+                {
+                    eprintln!(
+                        "Apple 页面连续 {} 次请求失败（{}），保留浏览器资料并重建查询会话后重试，本轮最多一次",
+                        self.consecutive_page_fetch_failures,
+                        self.route_label()
+                    );
+                    self.page_fetch_recovery_attempted = true;
+                    self.session = None;
+                    // 下一次循环仍走原来的节点检查、页面预热和请求间隔；
+                    // 整个恢复过程也在监控引擎的本轮查询总时限内。
+                    continue;
+                }
+            } else {
+                self.consecutive_page_fetch_failures = 0;
+            }
             let switch = match &result {
                 Err(ApiError::Blocked(_) | ApiError::RateLimited(_)) => self.route_rejected(region),
                 Ok(payload) if is_rejected_payload(payload) => self.route_rejected(region),
@@ -1942,11 +2126,12 @@ impl QueryState {
     fn explain_proxy_error(&self, error: ApiError) -> ApiError {
         match &error {
             ApiError::Transport(detail)
-                if self.clash.is_some() && detail.contains("ERR_PROXY_CONNECTION_FAILED") =>
+                if self.controller.is_some() && detail.contains("ERR_PROXY_CONNECTION_FAILED") =>
             {
                 ApiError::Transport(format!(
-                    "无法连接 Clash 专用端口 {}，请确认 Clash 正在运行并已加载果到雷达的扩展脚本",
-                    self.network.clash.proxy_port
+                    "无法连接 {} 专用端口 {}，请确认代理软件正在运行并已加载果到雷达专用端口配置",
+                    self.network.backend.label(),
+                    self.network.proxy_port()
                 ))
             }
             _ => error,
@@ -1954,6 +2139,7 @@ impl QueryState {
     }
 
     fn retry_now(&mut self) {
+        self.route_probes.clear();
         self.routes.release_waits(Instant::now());
         self.dead_routes.clear();
         self.route_failure = None;
@@ -1978,7 +2164,7 @@ impl QueryState {
         region: &'static Region,
         rejection: CyclePickupRejection,
     ) {
-        // Clash 模式下还能换到未冷却的节点时，同地区其他门店继续查询。
+        // 代理节点模式下还能换到未冷却的节点时，同地区其他门店继续查询。
         if self.can_switch_route(region) {
             return;
         }
@@ -2013,32 +2199,58 @@ impl AppleChromiumFetcher {
         self.state.lock().await.session = None;
     }
 
-    /// 手动指定 Clash 节点。
+    /// 手动指定代理 节点。
     pub async fn select_route(&self, node: &str) -> Result<Option<u32>, String> {
-        self.state.lock().await.select_route_manually(node).await
+        self.select_route_probe(node, None)
+            .await
+            .map(|probe| probe.delay_ms)
+    }
+
+    pub async fn select_route_probe(
+        &self,
+        node: &str,
+        backend: Option<apw_core::config::ProxyBackend>,
+    ) -> Result<NodeProbe, String> {
+        let mut state = self.state.lock().await;
+        if backend.is_some_and(|backend| backend != state.network.backend) {
+            return Err("代理软件已切换，请重新选择节点".into());
+        }
+        state.select_route_manually(node).await
     }
 
     /// 列出专用策略组的节点、测速结果和冷却状态。测速在锁外进行，不阻塞查询。
     pub async fn list_routes(&self) -> Result<RouteList, String> {
-        let (clash, group, filter) = {
+        let (controller, group, filter, network) = {
             let state = self.state.lock().await;
             (
-                state.clash_controller()?,
-                state.network.clash.group.clone(),
-                state.network.clash.node_filter.clone(),
+                state.proxy_controller()?,
+                state.network.group().to_string(),
+                state.network.node_filter().to_string(),
+                state.network.clone(),
             )
         };
-        let nodes = clash.group_nodes(&group, &filter).await?;
-        let delays = clash.group_delays(&group).await.unwrap_or_default();
+        let nodes = controller.group_nodes(&group, &filter).await?;
+        let probes = controller.group_probes(&group, &nodes.nodes).await;
+        let probe_error = probes.as_ref().err().cloned();
+        let probes = probes.unwrap_or_default();
         let state = self.state.lock().await;
+        if state.network != network {
+            return Err("线路设置已变化，请重新读取节点".into());
+        }
         let now = Instant::now();
         Ok(RouteList {
             now: nodes.now,
+            probe_error,
             nodes: nodes
                 .nodes
                 .into_iter()
                 .map(|name| RouteInfo {
-                    delay: delays.get(&name).copied(),
+                    delay: probes.get(&name).and_then(|probe| probe.delay_ms),
+                    reachable: if name == "DIRECT" {
+                        Some(true)
+                    } else {
+                        probes.get(&name).map(|probe| probe.reachable)
+                    },
                     resting: state.routes.is_resting(&name, now),
                     name,
                 })
@@ -2126,24 +2338,6 @@ impl AppleChromiumFetcher {
             }
             (BrowserPayload { status: 200, body }, true)
         } else {
-            if guard.session.is_none() {
-                let network_args = chromium_network_args(&guard.network);
-                match ChromiumSession::start_with_args(self.profile_dir.clone(), &network_args)
-                    .await
-                {
-                    Ok(session) => guard.session = Some(session),
-                    Err(error) => {
-                        let detail = match &error {
-                            ApiError::Transport(detail) | ApiError::BrowserUnavailable(detail) => {
-                                detail.clone()
-                            }
-                            _ => error.to_string(),
-                        };
-                        guard.session_start_failure = Some(detail);
-                        return Err(error);
-                    }
-                }
-            }
             let scope = if can_reuse_nearby && !nearby_unavailable {
                 PickupScope::Nearby(pickup_location.expect("附近查询必须有地点"))
             } else {
@@ -2158,6 +2352,7 @@ impl AppleChromiumFetcher {
                     } else {
                         &parts
                     },
+                    &self.profile_dir,
                 )
                 .await;
             let payload = match fetched {
@@ -2202,7 +2397,9 @@ impl AppleChromiumFetcher {
                 guard.unavailable_nearby.insert(cache_key.clone());
             }
             let fallback_scope = PickupScope::Store(store_number.to_string());
-            let fallback = guard.fetch_pickup(region, &fallback_scope, &parts).await;
+            let fallback = guard
+                .fetch_pickup(region, &fallback_scope, &parts, &self.profile_dir)
+                .await;
             payload = match fallback {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -2282,14 +2479,23 @@ impl AppleChromiumFetcher {
                                 .delivery_attempts
                                 .insert(DeliveryCacheKey::new(target, location));
                         }
-                        let fetched = {
+                        let fetched = async {
+                            guard.prepare_route(region).await?;
+                            guard.ensure_session(&self.profile_dir).await?;
+                            guard
+                                .session
+                                .as_mut()
+                                .expect("送货查询前会话已初始化")
+                                .ensure_region(region)
+                                .await?;
                             let QueryState { session, gate, .. } = &mut *guard;
                             session
                                 .as_mut()
                                 .expect("查询期间 Chromium 会话应当存在")
                                 .fetch_product_delivery(region, &missing_parts, location, gate)
                                 .await
-                        };
+                        }
+                        .await;
                         match fetched {
                             Ok(delivery) => {
                                 for target in targets.iter().filter(|target| {
@@ -2322,14 +2528,23 @@ impl AppleChromiumFetcher {
                         guard
                             .delivery_attempts
                             .insert(DeliveryCacheKey::new(target, location));
-                        let fetched = {
+                        let fetched = async {
+                            guard.prepare_route(region).await?;
+                            guard.ensure_session(&self.profile_dir).await?;
+                            guard
+                                .session
+                                .as_mut()
+                                .expect("送货查询前会话已初始化")
+                                .ensure_region(region)
+                                .await?;
                             let QueryState { session, gate, .. } = &mut *guard;
                             session
                                 .as_mut()
                                 .expect("查询期间 Chromium 会话应当存在")
                                 .fetch_watch_delivery(region, target, location, gate)
                                 .await
-                        };
+                        }
+                        .await;
                         match fetched {
                             Ok(Some(message)) => guard.cache_delivery(
                                 target,
@@ -2384,8 +2599,8 @@ impl AppleChromiumFetcher {
             0 => {
                 let error = browser_payload_transport_error(&payload.body);
                 // 页面里的 fetch 偶发失败并不等于 DevTools 连接或 Chromium 进程已死。
-                // 保留会话，让同轮其他门店继续查询；当前门店保持未知，并由下一轮
-                // 按用户设置的查询间隔重试。只有无法解析等真正会话故障才重建。
+                // 单次失败保留会话，让同轮其他门店继续查询；连续失败由
+                // fetch_pickup 有界重建。仍失败的门店由下一轮按原间隔重试。
                 if !is_page_fetch_failure(&error) {
                     guard.session = None;
                 }
@@ -2429,6 +2644,14 @@ impl Fetcher for AppleChromiumFetcher {
 
     async fn retry_now(&self) {
         self.state.lock().await.retry_now();
+    }
+
+    async fn cancel_pending_queries(&self) {
+        let mut state = self.state.lock().await;
+        state.session = None;
+        state.session_start_failure = None;
+        state.routes_loaded = false;
+        state.route_probes.clear();
     }
 
     async fn pickup_message(
@@ -2532,6 +2755,7 @@ pub(crate) mod tests {
             profile_dir: std::env::temp_dir(),
             socket,
             next_command_id: 1,
+            command_pending: false,
             locale: Some("zh_CN"),
             established: true,
         };
@@ -3953,6 +4177,239 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn 连续页面请求失败重建会话并重试当前门店而不切换节点() {
+        let profile = tempfile::tempdir().unwrap();
+        std::fs::write(profile.path().join("Cookies"), b"saved test cookies").unwrap();
+        let nodes = ["当前节点", "备用节点"];
+        let (settings, server) = crate::surge::tests::fake_surge(&nodes, "当前节点").await;
+        let (mut fetcher, old_peer) = cdp_responses(vec![
+            page_fetch_failure_response("TypeError: Failed to fetch"),
+            page_fetch_failure_response("TypeError: Failed to fetch"),
+        ])
+        .await;
+        fetcher.profile_dir = profile.path().to_path_buf();
+        fetcher
+            .state
+            .lock()
+            .await
+            .session
+            .as_mut()
+            .unwrap()
+            .profile_dir = fetcher.profile_dir.clone();
+        use_surge(&fetcher, settings, &nodes, "当前节点").await;
+        let (new_peer, requests) = queue_recorded_session(
+            &fetcher,
+            vec![
+                navigate_response(),
+                ready_response(),
+                pickup_response(&["R683"], "A", "available"),
+                pickup_response(&["R390"], "A", "unavailable"),
+            ],
+        )
+        .await;
+        let region = region_by_locale("zh_CN").unwrap();
+        fetcher.begin_cycle().await;
+        let first = fetcher
+            .pickup_message(region, "R580", &[test_target("A")], None)
+            .await;
+        assert!(first.as_ref().is_err_and(is_page_fetch_failure));
+
+        fetcher.state.lock().await.gate.last_sent = None;
+        let recovered = fetcher
+            .pickup_message(region, "R683", &[test_target("A")], None)
+            .await
+            .expect("第二次连续失败后应重建并重试当前门店");
+        assert!(recovered.parts["A"].availability.is_in_stock());
+        assert!(old_peer.await.unwrap(), "必须关闭连续失败的旧连接");
+
+        fetcher.state.lock().await.gate.last_sent = None;
+        let next = fetcher
+            .pickup_message(region, "R390", &[test_target("A")], None)
+            .await
+            .expect("后续门店应复用恢复后的会话");
+        assert!(!next.parts["A"].availability.is_in_stock());
+        assert_eq!(fetcher.cycle_stats().await.request_count, 4);
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0]["method"], "Page.navigate");
+        assert_eq!(requests[0]["params"]["url"], region.session_page_url());
+        assert!(sent_pairs(&requests[2]).contains(&("store".into(), "R683".into())));
+        assert!(sent_pairs(&requests[3]).contains(&("store".into(), "R390".into())));
+        drop(requests);
+        let state = fetcher.state.lock().await;
+        assert_eq!(
+            state.session.as_ref().unwrap().profile_dir,
+            fetcher.profile_dir
+        );
+        assert!(!state.routes.is_resting("当前节点", Instant::now()));
+        drop(state);
+        assert_eq!(
+            std::fs::read(profile.path().join("Cookies")).unwrap(),
+            b"saved test cookies"
+        );
+        let server = server.lock().await;
+        assert_eq!(server.selected, "当前节点");
+        assert!(
+            !server
+                .calls
+                .iter()
+                .any(|(method, path, _)| method == "POST" && path.contains("select"))
+        );
+        drop(server);
+        assert!(!new_peer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn 页面请求恢复跨轮次累计且实际http响应打断连续失败() {
+        let (fetcher, old_peer) = cdp_responses(vec![
+            page_fetch_failure_response("TypeError: Failed to fetch"),
+            http_response(503),
+            page_fetch_failure_response("TypeError: Failed to fetch"),
+            page_fetch_failure_response("TypeError: Failed to fetch"),
+        ])
+        .await;
+        fetcher.state.lock().await.test_sessions = Some(std::collections::VecDeque::new());
+        let new_peer = queue_session(
+            &fetcher,
+            vec![
+                navigate_response(),
+                ready_response(),
+                pickup_response(&["R390"], "A", "available"),
+            ],
+        )
+        .await;
+        let region = region_by_locale("zh_CN").unwrap();
+        for round in 1..=4 {
+            fetcher.begin_cycle().await;
+            fetcher.state.lock().await.gate.last_sent = None;
+            let result = fetcher
+                .pickup_message(region, "R390", &[test_target("A")], None)
+                .await;
+            if round < 4 {
+                assert!(matches!(result, Err(ApiError::Transport(_))));
+                assert!(
+                    !fetcher.state.lock().await.page_fetch_recovery_attempted,
+                    "503 是真实 HTTP 响应，前后各一次 fetch 失败不应合并触发重建"
+                );
+            } else {
+                assert!(
+                    result.unwrap().parts["A"].availability.is_in_stock(),
+                    "仅监控一家门店时，也应在连续失败的下一轮自动恢复"
+                );
+            }
+        }
+        assert!(old_peer.await.unwrap());
+        assert!(!new_peer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn 页面请求恢复每轮最多一次且下轮仍能恢复() {
+        let failure = page_fetch_failure_response("TypeError: Failed to fetch");
+        let (fetcher, old_peer) = cdp_responses(vec![failure.clone(), failure.clone()]).await;
+        fetcher.state.lock().await.test_sessions = Some(std::collections::VecDeque::new());
+        let first_replacement = queue_session(
+            &fetcher,
+            vec![
+                navigate_response(),
+                ready_response(),
+                failure.clone(),
+                failure.clone(),
+                failure.clone(),
+                failure,
+            ],
+        )
+        .await;
+        let region = region_by_locale("zh_CN").unwrap();
+        fetcher.begin_cycle().await;
+        for store in ["R580", "R683", "R390", "R581"] {
+            fetcher.state.lock().await.gate.last_sent = None;
+            let result = fetcher
+                .pickup_message(region, store, &[test_target("A")], None)
+                .await;
+            assert!(
+                result.as_ref().is_err_and(is_page_fetch_failure),
+                "本轮重建失败后应返回原请求错误，不能因反复启动耗尽模拟会话"
+            );
+        }
+        assert!(old_peer.await.unwrap());
+        let second_replacement = queue_session(
+            &fetcher,
+            vec![
+                navigate_response(),
+                ready_response(),
+                pickup_response(&["R390"], "A", "available"),
+            ],
+        )
+        .await;
+        fetcher.begin_cycle().await;
+        fetcher.state.lock().await.gate.last_sent = None;
+        let recovered = fetcher
+            .pickup_message(region, "R390", &[test_target("A")], None)
+            .await
+            .unwrap();
+        assert!(recovered.parts["A"].availability.is_in_stock());
+        assert!(first_replacement.await.unwrap());
+        assert!(!second_replacement.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn 页面请求恢复仍受本轮查询总时限约束() {
+        let failure = page_fetch_failure_response("TypeError: Failed to fetch");
+        let (fetcher, old_peer) = cdp_responses(vec![failure.clone(), failure]).await;
+        let region = region_by_locale("zh_CN").unwrap();
+        assert!(
+            fetcher
+                .pickup_message(region, "R390", &[test_target("A")], None)
+                .await
+                .is_err()
+        );
+        let (replacement, stalled_peer) = stalled_query_session().await;
+        let mut session = replacement.state.lock().await.session.take().unwrap();
+        session.locale = None;
+        {
+            let mut state = fetcher.state.lock().await;
+            state.test_sessions = Some(std::collections::VecDeque::from([session]));
+            state.gate.last_sent = None;
+        }
+        let config = apw_core::watcher::WatcherConfig {
+            query_timeout: Duration::from_millis(300),
+            interval: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let (watcher, mut events, engine) =
+            apw_core::watcher::Watcher::new(fetcher.clone(), config);
+        let task = tokio::spawn(engine);
+        watcher.set_targets(vec![test_target("A")]).await;
+        watcher.start().await;
+        let snapshot = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let apw_core::watcher::Event::CycleComplete { snapshot, .. } =
+                    events.recv().await.unwrap()
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            snapshot[0]
+                .availability
+                .describe_reason()
+                .unwrap()
+                .contains("查询超时")
+        );
+        assert!(old_peer.await.unwrap());
+        assert!(
+            stalled_peer.await.unwrap(),
+            "卡在重建后的页面预热也必须按总时限关闭连接"
+        );
+        assert!(fetcher.state.lock().await.session.is_none());
+        watcher.stop().await;
+        task.abort();
+    }
+
     #[test]
     fn 能找到本机chromium浏览器() {
         assert!(find_chromium().is_some());
@@ -4755,10 +5212,11 @@ pub(crate) mod tests {
     /// 直接写入 Clash 线路状态，不经过 `set_network`，以免测试里重启真实浏览器。
     async fn use_clash(fetcher: &AppleChromiumFetcher, clash: apw_core::config::ClashSettings) {
         let mut state = fetcher.state.lock().await;
-        state.clash = Some(ClashController::new(&clash));
+        state.controller = Some(ClashController::new(&clash).map(ProxyController::Clash));
         state.network = NetworkSettings {
             mode: NetworkMode::Clash,
             clash,
+            ..Default::default()
         };
     }
 
@@ -5090,10 +5548,11 @@ pub(crate) mod tests {
         .await;
         {
             let mut state = fetcher.state.lock().await;
-            state.clash = Some(ClashController::new(&clash));
+            state.controller = Some(ClashController::new(&clash).map(ProxyController::Clash));
             state.network = NetworkSettings {
                 mode: NetworkMode::Pinned,
                 clash,
+                ..Default::default()
             };
         }
         let region = region_by_locale("zh_CN").unwrap();
@@ -5213,5 +5672,599 @@ pub(crate) mod tests {
             .await
             .expect("连续两个节点被拒后第三个节点应能拿到结果");
         assert_eq!(fetcher.state.lock().await.routes.active(), Some("新加坡01"));
+    }
+    async fn use_surge(
+        fetcher: &AppleChromiumFetcher,
+        settings: apw_core::config::SurgeSettings,
+        nodes: &[&str],
+        current: &str,
+    ) {
+        let mut state = fetcher.state.lock().await;
+        state.controller =
+            Some(crate::surge::SurgeController::new(&settings).map(ProxyController::Surge));
+        state.network = NetworkSettings {
+            mode: NetworkMode::Clash,
+            backend: apw_core::config::ProxyBackend::Surge,
+            surge: settings,
+            ..NetworkSettings::default()
+        };
+        state
+            .routes
+            .set_routes(nodes.iter().map(|s| s.to_string()).collect());
+        state.routes.set_active(Some(current.into()));
+        // Never launch a real browser in these contract tests.
+        state.test_sessions = Some(std::collections::VecDeque::new());
+    }
+
+    async fn queue_session(
+        fetcher: &AppleChromiumFetcher,
+        responses: Vec<Value>,
+    ) -> tokio::task::JoinHandle<bool> {
+        queue_recorded_session(fetcher, responses).await.0
+    }
+
+    async fn queue_recorded_session(
+        fetcher: &AppleChromiumFetcher,
+        responses: Vec<Value>,
+    ) -> (tokio::task::JoinHandle<bool>, Arc<Mutex<Vec<Value>>>) {
+        let (replacement, peer, requests) = cdp_recorded_responses(responses).await;
+        let mut session = replacement.state.lock().await.session.take().unwrap();
+        session.locale = None;
+        session.profile_dir = fetcher.profile_dir.clone();
+        fetcher
+            .state
+            .lock()
+            .await
+            .test_sessions
+            .as_mut()
+            .unwrap()
+            .push_back(session);
+        (peer, requests)
+    }
+
+    #[tokio::test]
+    async fn surge拒绝后重建浏览器并保留冷却规则() {
+        for status in [541, 403, 429] {
+            let nodes = ["香港01", "日本01"];
+            let (settings, server) = crate::surge::tests::fake_surge(&nodes, "香港01").await;
+            let (fetcher, old_peer) = cdp_responses(vec![http_response(status)]).await;
+            use_surge(&fetcher, settings, &nodes, "香港01").await;
+            let new_peer = queue_session(
+                &fetcher,
+                vec![
+                    navigate_response(),
+                    ready_response(),
+                    pickup_response(&["R390"], "A", "available"),
+                ],
+            )
+            .await;
+            fetcher.begin_cycle().await;
+            let result = fetcher
+                .pickup_message(
+                    region_by_locale("zh_CN").unwrap(),
+                    "R390",
+                    &[test_target("A")],
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(result.parts["A"].availability.is_in_stock());
+            assert!(old_peer.await.unwrap(), "切换必须断开旧 CDP 会话");
+            let state = fetcher.state.lock().await;
+            assert_eq!(state.routes.active(), Some("日本01"));
+            assert!(state.routes.is_resting("香港01", Instant::now()));
+            assert!(state.test_sessions.as_ref().unwrap().is_empty());
+            assert!(
+                state
+                    .route_summary()
+                    .unwrap()
+                    .starts_with("Surge 节点 日本01")
+            );
+            drop(state);
+            assert_eq!(server.lock().await.selected, "日本01");
+            assert!(
+                !server
+                    .lock()
+                    .await
+                    .calls
+                    .iter()
+                    .any(|(_, path, _)| path.contains("requests/kill"))
+            );
+            fetcher.shutdown().await;
+            let _ = new_peer.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn surge手动与外部切换均释放旧会话() {
+        let nodes = ["香港01", "日本01"];
+        let (settings, server) = crate::surge::tests::fake_surge(&nodes, "香港01").await;
+        let (fetcher, old_peer) = cdp_responses(vec![]).await;
+        use_surge(&fetcher, settings, &nodes, "香港01").await;
+        fetcher
+            .state
+            .lock()
+            .await
+            .routes
+            .block("日本01", "www.apple.com.cn", Instant::now());
+        assert!(
+            fetcher
+                .select_route_probe("日本01", None)
+                .await
+                .unwrap()
+                .reachable
+        );
+        assert!(old_peer.await.unwrap());
+        assert!(
+            !fetcher
+                .state
+                .lock()
+                .await
+                .routes
+                .is_resting("日本01", Instant::now())
+        );
+        let (replacement, peer) = cdp_responses(vec![]).await;
+        fetcher.state.lock().await.session = replacement.state.lock().await.session.take();
+        server.lock().await.selected = "香港01".into();
+        fetcher.begin_cycle().await;
+        fetcher
+            .state
+            .lock()
+            .await
+            .prepare_route(region_by_locale("zh_CN").unwrap())
+            .await
+            .unwrap();
+        assert!(peer.await.unwrap());
+        assert!(fetcher.state.lock().await.session.is_none());
+    }
+
+    #[tokio::test]
+    async fn surge测速错误不冷却节点且不可达节点短暂跳过() {
+        let nodes = ["香港01", "日本01", "新加坡01"];
+        let (settings, server) = crate::surge::tests::fake_surge(&nodes, "香港01").await;
+        let (fetcher, _peer) = cdp_responses(vec![]).await;
+        use_surge(&fetcher, settings, &nodes, "香港01").await;
+        let region = region_by_locale("zh_CN").unwrap();
+        {
+            let mut state = fetcher.state.lock().await;
+            state
+                .routes
+                .block("香港01", "www.apple.com.cn", Instant::now());
+            server.lock().await.bad_probe = true;
+            assert!(matches!(
+                state.prepare_route(region).await,
+                Err(ApiError::Transport(_))
+            ));
+            assert!(!state.routes.is_resting("日本01", Instant::now()));
+            state.begin_cycle();
+            let mut api = server.lock().await;
+            api.bad_probe = false;
+            api.dead.push("日本01".into());
+            drop(api);
+            state.prepare_route(region).await.unwrap();
+            assert_eq!(state.routes.active(), Some("新加坡01"));
+            assert!(state.routes.is_resting("日本01", Instant::now()));
+            assert!(state.routes.is_available(
+                "日本01",
+                "www.apple.com.cn",
+                Instant::now() + Duration::from_secs(61)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn surge指定模式被拒不轮换且启动失败不会panic() {
+        let nodes = ["香港01", "日本01"];
+        let (settings, server) = crate::surge::tests::fake_surge(&nodes, "香港01").await;
+        let (fetcher, _peer) = cdp_responses(vec![http_response(541)]).await;
+        use_surge(&fetcher, settings, &nodes, "香港01").await;
+        {
+            let mut state = fetcher.state.lock().await;
+            state.network.mode = NetworkMode::Pinned;
+            state.network.surge.pinned_node = "香港01".into();
+        }
+        let region = region_by_locale("zh_CN").unwrap();
+        assert!(matches!(
+            fetcher
+                .pickup(region, "R390", &[test_target("A")], None)
+                .await,
+            Err(ApiError::Blocked(_))
+        ));
+        assert!(
+            !server
+                .lock()
+                .await
+                .calls
+                .iter()
+                .any(|(m, p, _)| m == "POST" && p.contains("select"))
+        );
+        fetcher.select_route_probe("日本01", None).await.unwrap();
+        fetcher.begin_cycle().await;
+        assert!(matches!(
+            fetcher
+                .pickup(region, "R390", &[test_target("A")], None)
+                .await,
+            Err(ApiError::BrowserUnavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn surge切换后缓存取货仍能重建会话查询配送() {
+        let nodes = ["香港01", "日本01"];
+        let (settings, _) = crate::surge::tests::fake_surge(&nodes, "香港01").await;
+        let (fetcher, _peer) = cdp_responses(vec![]).await;
+        use_surge(&fetcher, settings, &nodes, "香港01").await;
+        let target = nearby_target("R390", "A");
+        let region = region_by_locale("zh_CN").unwrap();
+        fetcher.state.lock().await.pickup_cache.insert(
+            (
+                region.locale,
+                vec!["A".into()],
+                target.pickup_location.clone().unwrap(),
+            ),
+            pickup_response(&["R390"], "A", "available")["result"]["result"]["value"]["body"]
+                .as_str()
+                .unwrap()
+                .into(),
+        );
+        fetcher.select_route_probe("日本01", None).await.unwrap();
+        let peer = queue_session(
+            &fetcher,
+            vec![navigate_response(), ready_response(), http_response(541)],
+        )
+        .await;
+        let destination = DeliveryRegion {
+            state: "四川".into(),
+            city: "成都".into(),
+            district: "锦江区".into(),
+        };
+        let result = fetcher
+            .pickup(region, "R390", &[target], Some(&destination))
+            .await
+            .unwrap();
+        assert!(
+            result.parts["A"].availability.is_in_stock(),
+            "配送失败不能覆盖取货库存"
+        );
+        assert_eq!(fetcher.cycle_stats().await.reused_response_count, 1);
+        assert_eq!(fetcher.cycle_stats().await.request_count, 1);
+        fetcher.shutdown().await;
+        let _ = peer.await;
+    }
+
+    #[tokio::test]
+    async fn 切换后端即使端口相同也重建会话并隔离冷却() {
+        let (fetcher, peer) = cdp_responses(vec![]).await;
+        let mut state = fetcher.state.lock().await;
+        state.network.mode = NetworkMode::Clash;
+        state.routes.set_routes(vec!["同名节点".into()]);
+        state
+            .routes
+            .block("同名节点", "www.apple.com.cn", Instant::now());
+        let mut next = state.network.clone();
+        next.backend = apw_core::config::ProxyBackend::Surge;
+        next.surge.proxy_port = next.clash.proxy_port;
+        state.set_network(next.clone());
+        assert!(state.session.is_none());
+        assert!(!state.routes.is_resting("同名节点", Instant::now()));
+        assert_eq!(
+            chromium_network_args(&next),
+            vec!["--proxy-server=http://127.0.0.1:7899"]
+        );
+        // Editing the inactive backend must not clear the active backend's pool.
+        state.routes.set_routes(vec!["同名节点".into()]);
+        state
+            .routes
+            .block("同名节点", "www.apple.com.cn", Instant::now());
+        next.clash.group = "另一个组".into();
+        state.set_network(next);
+        assert!(state.routes.is_resting("同名节点", Instant::now()));
+        drop(state);
+        assert!(peer.await.unwrap());
+    }
+    #[tokio::test]
+    async fn 旧后端的节点选择请求不会切换新后端() {
+        let nodes = ["香港01", "日本01"];
+        let (settings, server) = crate::surge::tests::fake_surge(&nodes, "香港01").await;
+        let (fetcher, _peer) = cdp_responses(vec![]).await;
+        use_surge(&fetcher, settings, &nodes, "香港01").await;
+        let error = fetcher
+            .select_route_probe("日本01", Some(apw_core::config::ProxyBackend::Clash))
+            .await
+            .unwrap_err();
+        assert!(error.contains("代理软件已切换"));
+        assert!(server.lock().await.calls.is_empty());
+    }
+    /// Explicit live acceptance test. Uses only the dedicated group and an IP
+    /// echo service, never Apple. Credentials and node names come from a private
+    /// temporary JSON file; always restore the original selection before failing.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "需要 APW_SURGE_LIVE_CONFIG，实际切换专用组并启动独立 Chromium"]
+    async fn 真实surge切换重建浏览器并验证出口() -> Result<(), String> {
+        let config_path =
+            std::env::var("APW_SURGE_LIVE_CONFIG").map_err(|_| "缺少 APW_SURGE_LIVE_CONFIG")?;
+        let config: Value =
+            serde_json::from_slice(&std::fs::read(config_path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        let field = |name: &str| {
+            config[name]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("缺少 {name}"))
+        };
+        let settings = apw_core::config::SurgeSettings {
+            controller: field("base")?,
+            secret: field("secret")?,
+            group: field("group")?,
+            proxy_port: config["proxy_port"]
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .ok_or("缺少有效代理端口")?,
+            ..Default::default()
+        };
+        let targets: Vec<String> =
+            serde_json::from_value(config["nodes"].clone()).map_err(|_| "缺少待验证节点")?;
+        if targets.len() != 2 || targets[0] == targets[1] {
+            return Err("需要两个不同的待验证节点".into());
+        }
+        let controller = crate::surge::SurgeController::new(&settings)?;
+        controller.version().await?;
+        let group = controller.group_nodes(&settings.group, "").await?;
+        let original = group.now.ok_or("专用组未返回当前节点")?;
+        if targets.iter().any(|node| !group.nodes.contains(node)) {
+            return Err("待验证节点不在专用组中".into());
+        }
+        let probes = controller.group_probes(&settings.group, &targets).await?;
+        if targets
+            .iter()
+            .any(|node| !probes.get(node).is_some_and(|probe| probe.reachable))
+        {
+            return Err("待验证节点测速未通过".into());
+        }
+        let profile = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let fetcher = AppleChromiumFetcher {
+            state: Arc::new(Mutex::new(QueryState::default())),
+            profile_dir: profile.path().to_path_buf(),
+        };
+        fetcher
+            .set_network(NetworkSettings {
+                mode: NetworkMode::Clash,
+                backend: apw_core::config::ProxyBackend::Surge,
+                surge: settings.clone(),
+                ..Default::default()
+            })
+            .await;
+        let result: Result<(), String> = async {
+            let mut ips = Vec::new();
+            let mut pids = Vec::new();
+            for (index, node) in targets.iter().enumerate() {
+                fetcher.select_route_probe(node, Some(apw_core::config::ProxyBackend::Surge)).await?;
+                let mut state = fetcher.state.lock().await;
+                if state.session.is_some() { return Err("Surge 切换后仍保留旧浏览器".into()); }
+                state.ensure_session(profile.path()).await.map_err(|e| e.to_string())?;
+                let session = state.session.as_mut().ok_or("浏览器未建立")?;
+                pids.push(session._process.child.id());
+                let navigation = session.command("Page.navigate", json!({"url": format!("https://api.ipify.org?format=json&apw-surge-check={index}")})).await.map_err(|e| e.to_string())?;
+                if let Some(error) = navigation.get("errorText") { return Err(format!("IP 查询导航失败：{error}")); }
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let ip = loop {
+                    let body = session.evaluate("document.body?.innerText ?? ''", false).await.map_err(|e| e.to_string())?;
+                    let response = body.as_str().and_then(|body| serde_json::from_str::<Value>(body).ok());
+                    if let Some(ip) = response.as_ref().and_then(|value| value["ip"].as_str()).and_then(|ip| ip.parse::<std::net::IpAddr>().ok()) { break ip; }
+                    if Instant::now() >= deadline { return Err("未能从查询浏览器取得出口 IP".into()); }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                };
+                eprintln!("Surge live route {}: probe={:?}ms, chromium_pid={}, ip={ip}", index + 1, probes[node].delay_ms, pids[index]);
+                ips.push(ip);
+            }
+            if ips[0] == ips[1] { return Err("两个节点的实际出口 IP 相同，不能确认切换验收".into()); }
+            if pids[0] == pids[1] { return Err("浏览器进程未重建".into()); }
+            eprintln!("Surge live acceptance: distinct exit IPs, rebuilt Chromium, same dedicated profile");
+            Ok(())
+        }.await;
+        fetcher.shutdown().await;
+        let restored = controller.select(&settings.group, &original).await;
+        if restored.is_ok() {
+            eprintln!("Surge original dedicated-group selection restored");
+        }
+        restored.map_err(|error| format!("恢复原节点失败：{error}"))?;
+        result
+    }
+    #[tokio::test]
+    async fn 当前节点和候选节点超过500毫秒均跳过且下一轮重新测速() {
+        let nodes = ["慢当前", "慢候选", "边界节点"];
+        let (settings, server) = crate::surge::tests::fake_surge(&nodes, "慢当前").await;
+        server.lock().await.delays = HashMap::from([
+            ("慢当前".into(), 800),
+            ("慢候选".into(), 501),
+            ("边界节点".into(), 500),
+        ]);
+        let (fetcher, peer) = cdp_responses(vec![]).await;
+        use_surge(&fetcher, settings, &nodes, "慢当前").await;
+        let region = region_by_locale("zh_CN").unwrap();
+        let mut state = fetcher.state.lock().await;
+        state.prepare_route(region).await.unwrap();
+        assert_eq!(state.routes.active(), Some("边界节点"));
+        assert!(state.routes.is_resting("慢当前", Instant::now()));
+        assert!(state.routes.is_resting("慢候选", Instant::now()));
+        let tested = server
+            .lock()
+            .await
+            .calls
+            .iter()
+            .filter(|(_, path, _)| path == "/v1/policies/test")
+            .count();
+        state.prepare_route(region).await.unwrap();
+        assert_eq!(
+            server
+                .lock()
+                .await
+                .calls
+                .iter()
+                .filter(|(_, path, _)| path == "/v1/policies/test")
+                .count(),
+            tested,
+            "同一轮复用测速结果"
+        );
+        server.lock().await.delays.insert("边界节点".into(), 650);
+        state.begin_cycle();
+        assert!(matches!(
+            state.prepare_route(region).await,
+            Err(ApiError::CoolingDown { .. })
+        ));
+        assert!(state.routes.is_resting("边界节点", Instant::now()));
+        drop(state);
+        assert!(peer.await.unwrap());
+        assert!(
+            server
+                .lock()
+                .await
+                .calls
+                .iter()
+                .filter(|(method, path, _)| method == "POST" && path.contains("select"))
+                .all(|(_, _, body)| body["policy"] == "边界节点")
+        );
+    }
+
+    #[tokio::test]
+    async fn 手动指定和固定模式均不得使用超过500毫秒的节点() {
+        let nodes = ["当前", "过慢"];
+        let (settings, server) = crate::surge::tests::fake_surge(&nodes, "当前").await;
+        server.lock().await.delays = HashMap::from([("当前".into(), 100), ("过慢".into(), 501)]);
+        let (fetcher, _peer) = cdp_responses(vec![]).await;
+        use_surge(&fetcher, settings, &nodes, "当前").await;
+        assert!(
+            fetcher
+                .select_route_probe("过慢", None)
+                .await
+                .unwrap_err()
+                .contains("超过 500")
+        );
+        let mut state = fetcher.state.lock().await;
+        state.network.mode = NetworkMode::Pinned;
+        state.network.surge.pinned_node = "过慢".into();
+        assert!(
+            matches!(state.prepare_route(region_by_locale("zh_CN").unwrap()).await, Err(ApiError::Transport(message)) if message.contains("超过 500"))
+        );
+        assert_eq!(server.lock().await.selected, "当前");
+        assert!(
+            !server
+                .lock()
+                .await
+                .calls
+                .iter()
+                .any(|(method, path, _)| method == "POST" && path.contains("select"))
+        );
+    }
+
+    async fn stalled_query_session() -> (AppleChromiumFetcher, tokio::task::JoinHandle<bool>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = socket.next().await;
+            assert!(matches!(request, Some(Ok(Message::Text(_)))));
+            // Deliberately never return this command's response.
+            matches!(
+                tokio::time::timeout(Duration::from_secs(3), socket.next()).await,
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_))))
+            )
+        });
+        let (fetcher, _old_peer) = cdp_responses(vec![]).await;
+        let (socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        {
+            let mut state = fetcher.state.lock().await;
+            state.session.as_mut().unwrap().socket = socket;
+            state.test_sessions = Some(std::collections::VecDeque::new());
+        }
+        (fetcher, peer)
+    }
+
+    #[tokio::test]
+    async fn 库存超时关闭未响应浏览器并能开始下一轮() {
+        let (fetcher, peer) = stalled_query_session().await;
+        let config = apw_core::watcher::WatcherConfig {
+            query_timeout: Duration::from_millis(300),
+            interval: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let (watcher, mut events, engine) =
+            apw_core::watcher::Watcher::new(fetcher.clone(), config);
+        let task = tokio::spawn(engine);
+        watcher.set_targets(vec![test_target("A")]).await;
+        watcher.start().await;
+        let first = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let apw_core::watcher::Event::CycleComplete { snapshot, .. } =
+                    events.recv().await.unwrap()
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            first[0]
+                .availability
+                .describe_reason()
+                .unwrap()
+                .contains("查询超时")
+        );
+        assert!(peer.await.unwrap(), "必须关闭旧 CDP 连接");
+        assert!(fetcher.state.lock().await.session.is_none());
+        let replacement_peer = queue_session(
+            &fetcher,
+            vec![
+                navigate_response(),
+                ready_response(),
+                pickup_response(&["R390"], "A", "available"),
+            ],
+        )
+        .await;
+        fetcher.state.lock().await.gate.last_sent = None;
+        assert!(watcher.retry_now().await);
+        let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let apw_core::watcher::Event::CycleComplete { snapshot, .. } =
+                    events.recv().await.unwrap()
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(recovered[0].availability.is_in_stock());
+        watcher.stop().await;
+        fetcher.shutdown().await;
+        let _ = replacement_peer.await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn 被取消的浏览器命令不能复用会话() {
+        let (fetcher, peer) = stalled_query_session().await;
+        let replacement = queue_session(&fetcher, vec![]).await;
+        let mut state = fetcher.state.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(30),
+            state
+                .session
+                .as_mut()
+                .unwrap()
+                .command("Runtime.evaluate", json!({"expression":"1"})),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(state.session.as_ref().unwrap().command_pending);
+        state.ensure_session(&fetcher.profile_dir).await.unwrap();
+        assert!(!state.session.as_ref().unwrap().command_pending);
+        drop(state);
+        assert!(peer.await.unwrap());
+        fetcher.shutdown().await;
+        let _ = replacement.await;
     }
 }

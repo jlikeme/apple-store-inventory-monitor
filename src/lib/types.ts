@@ -137,9 +137,26 @@ export interface ClashSettings {
   pinnedNode: string;
 }
 
+export type ProxyBackend = "clash" | "surge";
+export type SurgeSettings = ClashSettings;
+
 export interface NetworkSettings {
   mode: NetworkMode;
+  backend: ProxyBackend;
   clash: ClashSettings;
+  surge: SurgeSettings;
+}
+
+export interface NodeProbe {
+  reachable: boolean;
+  delayMs: number | null;
+}
+
+export interface ProxyRouteCheck extends ClashRouteCheck {
+  backend: ProxyBackend;
+  slowCount: number;
+  probeError: string | null;
+  routeVerified: boolean;
 }
 
 /** Bark 推送的中断级别，与 Rust 侧 `BarkLevel` 一一对应。 */
@@ -218,6 +235,8 @@ export interface RouteInfo {
   name: string;
   /** 批量测速延迟（毫秒）；超时或 DIRECT 为 null。 */
   delay: number | null;
+  /** null 表示未能完成测速，不能当作不可达。 */
+  reachable: boolean | null;
   /** 被 Apple 拒绝后冷却中，或暂时连不通。 */
   resting: boolean;
 }
@@ -225,6 +244,7 @@ export interface RouteInfo {
 export interface RouteList {
   now: string | null;
   nodes: RouteInfo[];
+  probeError: string | null;
 }
 
 export interface Settings {

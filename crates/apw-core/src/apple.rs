@@ -526,6 +526,12 @@ pub trait Fetcher: Clone + Send + Sync + 'static {
         async {}
     }
 
+    /// Release any browser/network work after the scheduler cancels a timed-out
+    /// cycle. Ordinary HTTP clients cancel their requests when futures drop.
+    fn cancel_pending_queries(&self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+
     fn pickup_message(
         &self,
         region: &'static Region,

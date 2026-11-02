@@ -52,7 +52,7 @@ async function setup() {
       await new Promise((resolve) => { release = resolve; });
     }
     if (command === "save_settings") persisted = { ...args.settings };
-    if (command === "set_interval") persisted.intervalSeconds = Math.max(5, args.seconds);
+    if (command === "set_interval") persisted.intervalSeconds = Math.max(1, args.seconds);
     if (command === "set_targets") persisted.targets = args.targets;
     if (command === "set_targets") return [];
     if (command === "set_interval") return persisted.intervalSeconds;
@@ -179,4 +179,78 @@ test("a product-specific Bark URL can be set and cleared", async () => {
 
   assert.equal(await ctx.store.setProductBarkUrl(target, ""), true);
   assert.deepEqual(ctx.persisted().productBarkUrls, {});
+});
+
+test("queued backend switches preserve the just-edited inactive configuration", async () => {
+  const ctx = await setup();
+  ctx.block();
+  const clash = { ...defaults.network.clash, secret: "new-key", proxyPort: 7999 };
+  const edited = ctx.store.saveNetworkSettings({ clash });
+  await tick();
+  const switched = ctx.store.saveNetworkSettings({ backend: "surge" });
+  const surge = { ...clash, controller: "http://127.0.0.1:6171", proxyPort: 7900 };
+  const configured = ctx.store.saveNetworkSettings({ surge });
+  ctx.release();
+  await Promise.all([edited, switched, configured]);
+  assert.equal(ctx.persisted().network.backend, "surge");
+  assert.deepEqual(ctx.persisted().network.clash, clash);
+  assert.deepEqual(ctx.persisted().network.surge, surge);
+  await ctx.store.saveNetworkSettings({ backend: "clash" });
+  assert.deepEqual(ctx.persisted().network.clash, clash);
+  assert.deepEqual(ctx.persisted().network.surge, surge);
+});
+
+test("proxy commands use the generic IPC contract", async () => {
+  const calls = [];
+  invoke = async (command, args) => {
+    calls.push({ command, args });
+    if (command === "select_proxy_node") return { reachable: true, delayMs: null };
+    if (command === "list_proxy_nodes") return { now: "A", nodes: [], probeError: null };
+    if (command === "test_proxy_route") return { version: "Surge HTTP API", nodes: ["A"], portOpen: true, probeError: null };
+  };
+  const store = await import(`../src/lib/store.ts?proxy=${++generation}`);
+  assert.equal(await store.selectProxyNode("A"), true);
+  assert.equal((await store.listProxyNodes()).now, "A");
+  await store.testProxyRoute({ ...defaults.network, backend: "surge" });
+  assert.deepEqual(calls.map(c => c.command), ["select_proxy_node", "list_proxy_nodes", "test_proxy_route"]);
+  assert.equal(calls[2].args.network.backend, "surge");
+});
+
+test("queued Bark critical and volume edits keep both settings and routes", async () => {
+  const ctx = await setup();
+  ctx.block();
+  const enabled = ctx.store.saveBarkOptions({ level: "critical" });
+  await tick();
+  const volume = ctx.store.saveBarkOptions({ volume: 8 });
+  const sound = ctx.store.saveBarkOptions({ sound: "alarm", call: true });
+  ctx.release();
+  await Promise.all([enabled, volume, sound]);
+  assert.deepEqual(ctx.persisted().barkOptions, {
+    level: "critical", volume: 8, sound: "alarm", call: true,
+  });
+  assert.equal(ctx.persisted().barkUrl, defaults.barkUrl);
+  assert.deepEqual(ctx.persisted().productBarkUrls, defaults.productBarkUrls);
+  await ctx.store.saveBarkOptions({ level: "active" });
+  assert.equal(ctx.persisted().barkOptions.volume, 8);
+});
+
+test("current proxy node reads fresh state without batch probes and exposes failures", async () => {
+  let selected = "香港01";
+  let unavailable = false;
+  const calls = [];
+  invoke = async (command, args) => {
+    calls.push({ command, args });
+    assert.equal(command, "get_proxy_node");
+    if (unavailable) throw new Error("控制接口不可用");
+    return selected;
+  };
+  const store = await import(`../src/lib/store.ts?current-node=${++generation}`);
+  const network = { ...defaults.network, backend: "surge", surge: { ...defaults.network.clash, controller: "http://127.0.0.1:6171" } };
+  assert.equal(await store.getCurrentProxyNode(network), "香港01");
+  selected = "日本01";
+  assert.equal(await store.getCurrentProxyNode(network), "日本01");
+  unavailable = true;
+  await assert.rejects(store.getCurrentProxyNode(network), /控制接口不可用/);
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[1].args, { network });
 });

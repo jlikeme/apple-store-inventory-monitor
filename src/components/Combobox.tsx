@@ -16,6 +16,7 @@ import { cn } from "@/lib/utils";
 export interface ComboboxOption {
   value: string;
   label: string;
+  disabled?: boolean;
   /** 复杂商品的补充说明，例如 Watch 自动搭配的表带。 */
   description?: string;
 }
@@ -86,6 +87,7 @@ export function Combobox({
                 <CommandItem
                   key={option.value}
                   value={option.label}
+                  disabled={option.disabled}
                   onSelect={() => {
                     onChange(option.value);
                     setOpen(false);

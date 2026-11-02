@@ -15,11 +15,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
+  BarkOptions,
   CatalogRefresh,
   Category,
   CategoryOption,
   ClashRouteCheck,
   ClashSettings,
+  NetworkSettings,
+  ProxyBackend,
+  ProxyRouteCheck,
+  NodeProbe,
   DeliveryLocalities,
   Product,
   Region,
@@ -99,6 +104,15 @@ const DEFAULT_SETTINGS: Settings = {
   stopOnHit: false,
   network: {
     mode: "system",
+    backend: "clash",
+    surge: {
+      controller: "http://127.0.0.1:6171",
+      secret: "",
+      group: "果到雷达",
+      proxyPort: 7900,
+      nodeFilter: "",
+      pinnedNode: "DIRECT",
+    },
     clash: {
       controller: "http://127.0.0.1:9097",
       secret: "",
@@ -385,6 +399,22 @@ export function saveSettings(patch: Partial<Settings>): Promise<boolean> {
   });
 }
 
+/** Merge Bark edits when their queued write starts so rapid changes keep every option. */
+export function saveBarkOptions(patch: Partial<BarkOptions>): Promise<boolean> {
+  return enqueueSettingsWrite(async () => {
+    try {
+      const saved = await invoke<Settings>("save_settings", {
+        settings: { ...state.settings, barkOptions: { ...state.settings.barkOptions, ...patch } },
+      });
+      update({ settings: saved });
+      return true;
+    } catch (err) {
+      pushLog(`保存 Bark 推送设置失败：${String(err)}`);
+      return false;
+    }
+  });
+}
+
 export function setCategory(category: Category): void {
   update({ category });
 }
@@ -542,6 +572,61 @@ export async function refreshProducts(): Promise<void> {
     // 是哪来的了。
     await loadCatalog(locale);
     update({ refreshing: false });
+  }
+}
+
+/** Merge network edits when their queued write actually starts. This keeps an
+ * input blur followed by a backend switch from restoring stale settings. */
+export async function saveNetworkSettings(patch: Partial<NetworkSettings>): Promise<boolean> {
+  return enqueueSettingsWrite(async () => {
+    try {
+      const saved = await invoke<Settings>("save_settings", {
+        settings: { ...state.settings, network: { ...state.settings.network, ...patch } },
+      });
+      update({ settings: saved, route: null });
+      return true;
+    } catch (err) {
+      pushLog(`保存线路设置失败：${String(err)}`);
+      return false;
+    }
+  });
+}
+
+export async function testProxyRoute(network: NetworkSettings): Promise<ProxyRouteCheck | string> {
+  try {
+    const result = await invoke<ProxyRouteCheck>("test_proxy_route", { network });
+    pushLog(`${result.version}，节点 ${result.nodes.length} 个；专用端口 ${result.portOpen ? "可连接（专用路由尚未验证）" : "无法连接"}${result.probeError ? `；${result.probeError}` : ""}。`);
+    return result;
+  } catch (err) {
+    const message = String(err);
+    pushLog(`线路检查失败：${message}`);
+    return message;
+  }
+}
+
+export async function listProxyNodes(): Promise<RouteList | string> {
+  try {
+    return await invoke<RouteList>("list_proxy_nodes");
+  } catch (err) {
+    return String(err);
+  }
+}
+
+/** Read the controller's current choice without running any node probes. */
+export function getCurrentProxyNode(network: NetworkSettings): Promise<string | null> {
+  return invoke<string | null>("get_proxy_node", { network });
+}
+
+export async function selectProxyNode(node: string, backend: ProxyBackend = state.settings.network.backend): Promise<boolean> {
+  try {
+    const probe = await invoke<NodeProbe>("select_proxy_node", { node, backend });
+    const result = node === "DIRECT" ? "" : !probe.reachable ? "（测速未通过，仍按指定切换）"
+      : probe.delayMs === null ? "（可达，未返回延迟）" : `（测速 ${probe.delayMs} ms）`;
+    pushLog(`已手动切换到节点 ${node}${result}，下一次查询生效。`);
+    return true;
+  } catch (err) {
+    pushLog(`手动切换节点失败：${String(err)}`);
+    return false;
   }
 }
 

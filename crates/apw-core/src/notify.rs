@@ -225,6 +225,8 @@ pub struct Bark {
     http: reqwest::Client,
     timeout: Duration,
     push: BarkPush,
+    /// Compatibility for callers that use the original critical-alert controls.
+    critical_alert: Option<(bool, u8)>,
 }
 
 impl Bark {
@@ -242,12 +244,20 @@ impl Bark {
             http,
             timeout: BARK_TIMEOUT,
             push: BarkPush::default(),
+            critical_alert: None,
         }
     }
 
     /// 附加推送增强参数（等级、铃声、音量、持续响铃）。
     pub fn with_push(mut self, push: BarkPush) -> Self {
         self.push = push;
+        self
+    }
+
+    /// 重要通知开关优先于 URL 中的 critical 与 volume 参数。
+    /// 关闭时保留其他通知级别、分组、铃声等用户参数。
+    pub fn with_critical_alert(mut self, enabled: bool, volume: u8) -> Self {
+        self.critical_alert = Some((enabled, volume.min(10)));
         self
     }
 
@@ -273,7 +283,10 @@ impl Notifier for Bark {
             return Ok(());
         }
 
-        let url = build_bark_url(&self.base_url, n, &self.push)?;
+        let mut url = build_bark_url(&self.base_url, n, &self.push)?;
+        if let Some((enabled, volume)) = self.critical_alert {
+            apply_bark_critical_alert(&mut url, enabled, volume);
+        }
 
         let mut resp = self
             .http
@@ -473,6 +486,26 @@ fn config_err(detail: String) -> NotifyError {
         channel: BARK.to_string(),
         detail,
     }
+}
+
+/// 只替换我们控制的参数。用解码后的键识别 level/volume，但原样保留其他
+/// 查询段，避免破坏自定义分组、铃声以及旧地址中的非标准百分号转义。
+pub(crate) fn apply_bark_critical_alert(url: &mut Url, enabled: bool, volume: u8) {
+    let query = url.query().unwrap_or_default();
+    let mut parts: Vec<String> = query
+        .split('&')
+        .filter(|segment| !segment.is_empty())
+        .zip(url.query_pairs())
+        .filter_map(|(raw, (key, value))| {
+            let replaced = key == "volume" || (key == "level" && (enabled || value == "critical"));
+            (!replaced).then(|| raw.to_string())
+        })
+        .collect();
+    if enabled {
+        parts.push("level=critical".into());
+        parts.push(format!("volume={}", volume.min(10)));
+    }
+    url.set_query((!parts.is_empty()).then(|| parts.join("&")).as_deref());
 }
 
 const HEX: &[u8; 16] = b"0123456789ABCDEF";

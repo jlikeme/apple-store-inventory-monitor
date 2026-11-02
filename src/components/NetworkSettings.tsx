@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Copy, FileCode2, Globe, LoaderCircle, PlugZap, RefreshCw } from "lucide-react";
 import { Combobox } from "@/components/Combobox";
 import { CollapsiblePanel } from "@/components/CollapsiblePanel";
@@ -14,9 +14,11 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { listClashNodes, saveSettings, selectClashNode, testClashRoute } from "@/lib/store";
+import { getCurrentProxyNode, listProxyNodes, saveNetworkSettings, selectProxyNode, testProxyRoute } from "@/lib/store";
+import { MAX_NODE_DELAY_MS, nodeFromRoute, nodeLabel, nodeTooSlow, nodeUsable } from "@/lib/proxy";
 import type {
-  ClashRouteCheck,
+  ProxyRouteCheck,
+  ProxyBackend,
   ClashSettings,
   NetworkMode,
   NetworkSettings as Network,
@@ -24,15 +26,15 @@ import type {
 } from "@/lib/types";
 
 const MODE_HINTS: Record<NetworkMode, string> = {
-  system: "跟随系统代理。开着 Clash 系统代理或 TUN 时，出口由 Clash 规则决定。",
-  pinned: "经 Clash 专用端口固定使用下方指定的节点，不自动切换；选 DIRECT 即用本机网络，开着 TUN 也有效。",
+  system: "跟随系统代理，出口由系统代理或增强模式的规则决定。",
+  pinned: "经所选代理软件的专用端口固定使用指定节点，不自动切换；选 DIRECT 即用本机网络。",
   clash: "只走专用端口；节点被 Apple 拒绝时冷却并换下一个，不影响电脑本身的节点。",
 };
 
 const MODE_LABELS: Record<NetworkMode, string> = {
   system: "跟随系统代理",
   pinned: "指定节点",
-  clash: "Clash 节点轮换",
+  clash: "节点轮换",
 };
 
 /** Clash Verge「全局扩展脚本」模板，与 README 中的脚本保持一致。 */
@@ -225,25 +227,63 @@ function ClashSetupGuide({ clash }: { clash: ClashSettings }) {
   );
 }
 
-/** 从每轮日志的线路说明中取出节点名，例如「Clash 节点 香港01（本轮切换 1 次）」。 */
-function nodeFromRoute(route: string | null): string | null {
-  const match = route?.match(/^Clash 节点 (.+?)(（本轮切换 \d+ 次）)?$/);
-  const node = match?.[1];
-  return node && node !== "尚未选定" ? node : null;
+function SurgeSetupGuide({ settings }: { settings: ClashSettings }) {
+  const group = settings.group || "果到雷达";
+  const port = settings.proxyPort || 7900;
+  const address = settings.controller.replace(/^https?:\/\//, "").replace(/\/$/, "") || "127.0.0.1:6171";
+  return (
+    <Dialog>
+      <DialogTrigger asChild><Button variant="outline" size="sm">Surge 配置教程</Button></DialogTrigger>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>配置 Surge for Mac</DialogTitle>
+          <DialogDescription>手动添加专用策略组与端口。保留原有监听和规则，应用只切换专用组。</DialogDescription>
+        </DialogHeader>
+        <ol className="space-y-5">
+          <GuideStep index={1} title="开启 HTTP API">
+            <p>在 [General] 中配置本机控制接口，将 YOUR_API_KEY 换成自己的密钥，再把相同密钥填入应用。推荐 Surge Mac 6.10 或更新版本。</p>
+            <pre className="overflow-x-auto rounded-lg bg-muted p-3 text-xs select-text">{`http-api = YOUR_API_KEY@${address}`}</pre>
+            <p>控制接口默认使用 HTTP；若自行开启 TLS，需先信任 Surge 证书。</p>
+          </GuideStep>
+          <GuideStep index={2} title="追加专用监听端口">
+            <p>在 [General] 现有 http-listen 后追加 127.0.0.1:{port}。例如原端口为 6152：</p>
+            <pre className="overflow-x-auto rounded-lg bg-muted p-3 text-xs select-text">{`http-listen = 127.0.0.1:6152, 127.0.0.1:${port}`}</pre>
+            <p>保留自己原有的地址和端口；专用端口不要与其他软件重复。</p>
+          </GuideStep>
+          <GuideStep index={3} title="添加专用 select 策略组">
+            <p>在 [Proxy Group] 中添加下面一行，将机场A、机场B 替换为已有策略组名。使用组内节点，不改变原策略组的选择。</p>
+            <pre className="overflow-x-auto rounded-lg bg-muted p-3 text-xs select-text">{`${group} = select, DIRECT, include-other-group="机场A,机场B"`}</pre>
+            <p>多个订阅有同名节点时，先在 Surge 中设置名称前缀。外部节点以策略组 API 返回的成员名为准。</p>
+          </GuideStep>
+          <GuideStep index={4} title="添加端口规则并检查">
+            <p>在 [Rule] 最前面添加下面一行，保存并保持 Surge 为规则模式，然后在应用中检查线路。</p>
+            <pre className="overflow-x-auto rounded-lg bg-muted p-3 text-xs select-text">{`IN-PORT,${port},${group}`}</pre>
+            <p>检查端口可连接不代表专用路由已生效。应在 Surge 请求记录中确认命中该规则，并切换节点验证出口。目录刷新失败时仍可能回退系统网络。</p>
+          </GuideStep>
+        </ol>
+      </DialogContent>
+    </Dialog>
+  );
 }
 
-function nodeLabel(name: string, delay: number | null, resting: boolean): string {
-  const display = name.replace(/^APW·/, "");
-  const status = name === "DIRECT" ? "家宽直连" : delay === null ? "测速超时" : `${delay} ms`;
-  return `${display} · ${status}${resting ? " · 冷却中" : ""}`;
+interface CurrentNodeStatus {
+  now: string | null;
+  loading: boolean;
+  error: string | null;
 }
 
 function NodePicker({
   route,
+  backend,
+  network,
   pinned,
   onPin,
+  onCurrentChange,
 }: {
   route: string | null;
+  backend: ProxyBackend;
+  network: Network;
+  onCurrentChange: (status: CurrentNodeStatus) => void;
   /** 指定节点模式下固定使用的节点；轮换模式为 null。 */
   pinned: string | null;
   onPin: (node: string) => Promise<void>;
@@ -253,16 +293,63 @@ function NodePicker({
   const [loading, setLoading] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [current, setCurrent] = useState<string | null>(null);
+  const [currentError, setCurrentError] = useState<string | null>(null);
+  const currentRequest = useRef(0);
+  const mounted = useRef(false);
+
+  const refreshCurrent = useCallback(async () => {
+    if (!mounted.current) return;
+    const request = ++currentRequest.current;
+    try {
+      const now = await getCurrentProxyNode(network);
+      if (!mounted.current || request !== currentRequest.current) return;
+      setCurrent(now);
+      setCurrentError(null);
+      onCurrentChange({ now, loading: false, error: null });
+    } catch (error) {
+      if (!mounted.current || request !== currentRequest.current) return;
+      const message = String(error);
+      setCurrent(null);
+      setCurrentError(message);
+      onCurrentChange({ now: null, loading: false, error: message });
+    }
+  }, [network, onCurrentChange]);
+
+  useEffect(() => {
+    mounted.current = true;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    onCurrentChange({ now: null, loading: true, error: null });
+    const poll = async () => {
+      if (document.visibilityState !== "hidden") await refreshCurrent();
+      if (!cancelled) timer = setTimeout(() => void poll(), 5000);
+    };
+    const onFocus = () => {
+      if (document.visibilityState !== "hidden") void refreshCurrent();
+    };
+    void poll();
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    return () => {
+      cancelled = true;
+      mounted.current = false;
+      currentRequest.current += 1;
+      if (timer) clearTimeout(timer);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+    };
+  }, [refreshCurrent, onCurrentChange]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const result = await listClashNodes();
+    const result = await listProxyNodes();
     if (typeof result === "string") {
       setError(result);
     } else {
-      setError(null);
+      setError(result.probeError);
       setList(result);
-      setCurrent(result.now);
+      // A batch probe may take seconds. Its `now` snapshot must not replace
+      // the live selection read independently from the controller.
     }
     setLoading(false);
   }, []);
@@ -271,18 +358,20 @@ function NodePicker({
     void refresh();
   }, [refresh]);
 
-  // 自动切换后跟上每轮实际使用的节点。
-  const routeNode = nodeFromRoute(route);
+  // A completed cycle is a refresh signal, not the current source of truth:
+  // the user may have switched the proxy again before this event arrived.
+  const routeNode = nodeFromRoute(route, backend);
   useEffect(() => {
-    if (routeNode) setCurrent(routeNode);
-  }, [routeNode]);
+    if (routeNode) void refreshCurrent();
+  }, [route, routeNode, refreshCurrent]);
   const value = pinned ?? current;
 
   const options = (list?.nodes ?? []).map((node) => ({
     value: node.name,
-    label: nodeLabel(node.name, node.delay, node.resting),
+    label: nodeLabel(node),
+    disabled: nodeTooSlow(node),
   }));
-  const reachable = list?.nodes.filter((node) => node.name === "DIRECT" || node.delay !== null).length ?? 0;
+  const reachable = list?.nodes.filter(nodeUsable).length ?? 0;
 
   return (
     <div className="field-group">
@@ -306,9 +395,10 @@ function NodePicker({
             setSwitching(true);
             if (pinned !== null) {
               await onPin(node);
-            } else if (await selectClashNode(node)) {
-              setCurrent(node);
+            } else {
+              await selectProxyNode(node, backend);
             }
+            await refreshCurrent();
             setSwitching(false);
           }}
         />
@@ -320,22 +410,22 @@ function NodePicker({
           aria-label="重新测速"
           title="重新测速"
           disabled={loading}
-          onClick={() => void refresh()}
+          onClick={() => { void refresh(); void refreshCurrent(); }}
         >
           <RefreshCw className={loading ? "animate-spin" : ""} aria-hidden="true" />
         </Button>
       </div>
       <p className="text-[11px] leading-4 break-words text-muted-foreground">
-        {error ??
+        {currentError ?? error ??
           (pinned !== null
-            ? "固定使用该节点，被 Apple 拒绝时不会自动切换，下一轮继续用它重试。"
-            : "手动指定后立即生效；该节点之后被 Apple 拒绝或连不通时，仍会自动切换到下一个。")}
+            ? "固定使用该节点；延迟超过 500 ms 或测速不可达时停止本次查询，不自动切换。"
+            : "自动跳过延迟超过 500 ms 的节点；被 Apple 拒绝或连不通时仍会自动切换。")}
       </p>
     </div>
   );
 }
 
-function CheckResult({ check, port }: { check: ClashRouteCheck | string | null; port: number }) {
+function CheckResult({ check, port, currentNode }: { check: ProxyRouteCheck | string | null; port: number; currentNode: CurrentNodeStatus }) {
   if (check === null) return null;
   if (typeof check === "string") {
     return <p role="alert" className="text-[11px] leading-4 break-words text-destructive">{check}</p>;
@@ -344,25 +434,35 @@ function CheckResult({ check, port }: { check: ClashRouteCheck | string | null; 
     <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 rounded-lg border border-border/55 bg-background/30 px-3 py-2 text-[11px] leading-4">
       <dt className="text-muted-foreground">内核</dt>
       <dd className="truncate">{check.version}</dd>
-      <dt className="text-muted-foreground">可用节点</dt>
+      <dt className="text-muted-foreground">节点总数</dt>
       <dd>
         {check.nodes.length} 个{check.skipped > 0 ? `（已排除 ${check.skipped} 个信息节点）` : ""}
       </dd>
-      <dt className="text-muted-foreground">测速超时</dt>
+      <dt className="text-muted-foreground">测速不可达</dt>
       <dd className={check.timeoutCount > 0 ? "text-unknown" : ""}>
-        {check.timeoutCount} 个{check.timeoutCount > 0 ? "，切换前会逐个复测并跳过" : ""}
+        {check.probeError ?? `${check.timeoutCount} 个${check.timeoutCount > 0 ? "，切换前会逐个复测并跳过" : ""}`}
+      </dd>
+      <dt className="text-muted-foreground">超过 {MAX_NODE_DELAY_MS} ms</dt>
+      <dd className={check.slowCount > 0 ? "text-unknown" : ""}>
+        {check.probeError ? "未能确认" : `${check.slowCount} 个，查询时自动跳过`}
       </dd>
       <dt className="text-muted-foreground">当前节点</dt>
-      <dd className="break-words">{check.now ?? "未选择"}</dd>
+      <dd className={currentNode.error ? "break-words text-destructive" : "break-words"}>
+        {currentNode.loading ? "读取中…" : currentNode.error ? "无法读取当前节点" : currentNode.now ?? "未选择"}
+      </dd>
       <dt className="text-muted-foreground">端口 {port}</dt>
       <dd className={check.portOpen ? "text-in-stock" : "text-destructive"}>
-        {check.portOpen ? "可连接" : "无法连接，请检查脚本中的 listeners"}
+        {check.portOpen ? "可连接" : "无法连接，请检查专用端口配置"}
       </dd>
+      {check.portOpen && !check.routeVerified ? <>
+        <dt className="text-muted-foreground">专用路由</dt>
+        <dd>尚未验证，请在代理软件中核对请求命中的策略组。</dd>
+      </> : null}
     </dl>
   );
 }
 
-export function NetworkSettings({
+function NetworkSettingsEditor({
   network,
   running,
   route,
@@ -371,21 +471,28 @@ export function NetworkSettings({
   running: boolean;
   route: string | null;
 }) {
-  const [draft, setDraft] = useState<ClashSettings>(network.clash);
+  const backend = network.backend;
+  const isSurge = backend === "surge";
+  const active = network[backend];
+  const [draft, setDraft] = useState<ClashSettings>(active);
   const [checking, setChecking] = useState(false);
-  const [check, setCheck] = useState<ClashRouteCheck | string | null>(null);
+  const [check, setCheck] = useState<ProxyRouteCheck | string | null>(null);
+  const [currentNode, setCurrentNode] = useState<CurrentNodeStatus>({ now: null, loading: true, error: null });
+  const checkGeneration = useRef(0);
+  const draftKey = JSON.stringify(draft);
+  useEffect(() => { checkGeneration.current += 1; setCheck(null); }, [draftKey, backend]);
 
-  useEffect(() => setDraft(network.clash), [network.clash]);
+  useEffect(() => { setDraft(active); setCheck(null); }, [active, backend]);
 
-  const saveClash = () => {
-    if (JSON.stringify(draft) === JSON.stringify(network.clash)) return;
+  const saveProxy = () => {
+    if (JSON.stringify(draft) === JSON.stringify(active)) return;
     setCheck(null);
-    void saveSettings({ network: { ...network, clash: draft } });
+    void saveNetworkSettings({ [backend]: draft });
   };
   const text = (key: "controller" | "secret" | "group" | "nodeFilter") => ({
     value: draft[key],
     onChange: (event: React.ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, [key]: event.target.value }),
-    onBlur: saveClash,
+    onBlur: saveProxy,
   });
 
   return (
@@ -393,8 +500,8 @@ export function NetworkSettings({
       id="network"
       icon={<Globe className="size-4" />}
       title="查询线路"
-      subtitle={route ? `当前：${route}` : "Apple 查询使用的出口 IP"}
-      summary={route ?? MODE_LABELS[network.mode]}
+      subtitle={route ? `最近查询：${route}` : "Apple 查询使用的出口 IP"}
+      summary={route ? `最近查询：${route}` : MODE_LABELS[network.mode]}
     >
       <div className="field-group">
         <Label htmlFor="network-mode" className="control-label">出口方式</Label>
@@ -402,7 +509,7 @@ export function NetworkSettings({
           value={network.mode}
           onValueChange={(mode) => {
             setCheck(null);
-            void saveSettings({ network: { ...network, mode: mode as NetworkMode } });
+            void saveNetworkSettings({ mode: mode as NetworkMode });
           }}
         >
           <SelectTrigger id="network-mode" className="control-surface w-full" aria-label="出口方式">
@@ -422,19 +529,36 @@ export function NetworkSettings({
 
       {network.mode !== "system" ? (
         <div className="mt-3 grid min-w-0 gap-3">
+          <div className="field-group">
+            <Label htmlFor="proxy-backend" className="control-label">代理软件</Label>
+            <Select value={backend} onValueChange={(value) => {
+              setCheck(null);
+              void saveNetworkSettings({ backend: value as ProxyBackend });
+            }}>
+              <SelectTrigger id="proxy-backend" className="control-surface w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="clash">Clash / mihomo</SelectItem>
+                <SelectItem value="surge">Surge for Mac</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
           <div className="flex items-center justify-between gap-3 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2">
             <p className="text-[11px] leading-4 text-muted-foreground">
-              首次使用需要先在 Clash 中开启外部控制器并添加扩展脚本，按教程约 3 分钟完成。
+              {isSurge ? "首次使用需要在 Surge 中开启 HTTP API，添加专用组、监听端口和 IN-PORT 规则。" : "首次使用需要先在 Clash 中开启外部控制器并添加扩展脚本，按教程约 3 分钟完成。"}
             </p>
-            <ClashSetupGuide clash={draft} />
+            {isSurge ? <SurgeSetupGuide settings={draft} /> : <ClashSetupGuide clash={draft} />}
           </div>
           <NodePicker
+            key={JSON.stringify([backend, active.controller, active.secret, active.group, active.nodeFilter])}
+            backend={backend}
+            network={network}
+            onCurrentChange={setCurrentNode}
             route={route}
-            pinned={network.mode === "pinned" ? network.clash.pinnedNode : null}
+            pinned={network.mode === "pinned" ? active.pinnedNode : null}
             onPin={async (node) => {
               // 先保存，保证重启后仍用该节点；再立即切换，不必等到下一轮。
-              if (await saveSettings({ network: { ...network, clash: { ...network.clash, pinnedNode: node } } })) {
-                await selectClashNode(node);
+              if (await saveNetworkSettings({ [backend]: { ...active, pinnedNode: node } })) {
+                await selectProxyNode(node, backend);
               }
             }}
           />
@@ -443,10 +567,10 @@ export function NetworkSettings({
             <Input
               id="clash-controller"
               className="control-surface select-text"
-              placeholder="127.0.0.1:9097"
+              placeholder={isSurge ? "127.0.0.1:6171" : "127.0.0.1:9097"}
               {...text("controller")}
             />
-            <FieldHint>Clash → 设置 → Clash 设置 → 外部控制中的「监听地址」</FieldHint>
+            <FieldHint>{isSurge ? "Surge [General] 中 http-api 的监听地址" : "Clash → 设置 → Clash 设置 → 外部控制中的「监听地址」"}</FieldHint>
           </div>
           <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_6rem] gap-2">
             <div className="field-group">
@@ -455,10 +579,10 @@ export function NetworkSettings({
                 id="clash-secret"
                 type="password"
                 className="control-surface select-text"
-                placeholder="没有可留空"
+                placeholder={isSurge ? "http-api 的 API 密钥" : "没有可留空"}
                 {...text("secret")}
               />
-              <FieldHint>同一处的「API 访问密钥」</FieldHint>
+              <FieldHint>{isSurge ? "http-api 中 @ 前面的密钥" : "同一处的「API 访问密钥」"}</FieldHint>
             </div>
             <div className="field-group">
               <Label htmlFor="clash-port" className="control-label">专用端口</Label>
@@ -466,22 +590,22 @@ export function NetworkSettings({
                 id="clash-port"
                 inputMode="numeric"
                 className="control-surface select-text tabular-nums"
-                placeholder="7899"
+                placeholder={isSurge ? "7900" : "7899"}
                 value={draft.proxyPort ? String(draft.proxyPort) : ""}
                 onChange={(event) => {
                   const port = Number.parseInt(event.target.value.replace(/\D/g, ""), 10);
                   setDraft({ ...draft, proxyPort: Number.isFinite(port) ? Math.min(port, 65535) : 0 });
                 }}
-                onBlur={saveClash}
+                onBlur={saveProxy}
               />
-              <FieldHint>脚本 listeners 的端口</FieldHint>
+              <FieldHint>{isSurge ? "http-listen 与 IN-PORT 的专用端口" : "脚本 listeners 的端口"}</FieldHint>
             </div>
           </div>
           <div className="grid min-w-0 grid-cols-2 gap-2">
             <div className="field-group">
               <Label htmlFor="clash-group" className="control-label">策略组</Label>
               <Input id="clash-group" className="control-surface select-text" placeholder="果到雷达" {...text("group")} />
-              <FieldHint>脚本中的 APW_GROUP</FieldHint>
+              <FieldHint>{isSurge ? "独立的 select 策略组" : "脚本中的 APW_GROUP"}</FieldHint>
             </div>
             <div className="field-group">
               <Label htmlFor="clash-filter" className="control-label">节点关键词</Label>
@@ -503,7 +627,9 @@ export function NetworkSettings({
               disabled={checking}
               onClick={async () => {
                 setChecking(true);
-                setCheck(await testClashRoute(draft));
+                const generation = checkGeneration.current;
+                const result = await testProxyRoute({ ...network, [backend]: draft });
+                if (generation === checkGeneration.current) setCheck(result);
                 setChecking(false);
               }}
             >
@@ -511,9 +637,13 @@ export function NetworkSettings({
               检查线路
             </Button>
           </div>
-          <CheckResult check={check} port={draft.proxyPort} />
+          <CheckResult check={check} port={draft.proxyPort} currentNode={currentNode} />
         </div>
       ) : null}
     </CollapsiblePanel>
   );
+}
+
+export function NetworkSettings(props: { network: Network; running: boolean; route: string | null }) {
+  return <NetworkSettingsEditor key={props.network.backend} {...props} />;
 }

@@ -1,0 +1,25 @@
+{
+  "果到雷达": [
+    {
+      "isGroup": false,
+      "name": "DIRECT",
+      "typeDescription": "DIRECT",
+      "lineHash": "POLICY::fixture-direct",
+      "enabled": true
+    },
+    {
+      "isGroup": false,
+      "name": "香港01",
+      "typeDescription": "VMess",
+      "lineHash": "POLICY::fixture-hong-kong",
+      "enabled": true
+    },
+    {
+      "isGroup": false,
+      "name": "新加坡01",
+      "typeDescription": "VMess",
+      "lineHash": "POLICY::fixture-singapore",
+      "enabled": true
+    }
+  ]
+}

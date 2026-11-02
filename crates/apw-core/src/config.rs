@@ -223,15 +223,95 @@ impl Default for ClashSettings {
     }
 }
 
+/// 控制专用查询出口的代理软件。旧配置继续使用 Clash。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyBackend {
+    #[default]
+    Clash,
+    Surge,
+}
+
+impl ProxyBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Clash => "Clash",
+            Self::Surge => "Surge",
+        }
+    }
+}
+
+// 两种后端具有相同的配置字段；单独的默认值和存储字段避免切换时覆盖设置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SurgeSettings {
+    pub controller: String,
+    pub secret: String,
+    pub group: String,
+    pub proxy_port: u16,
+    pub node_filter: String,
+    pub pinned_node: String,
+}
+
+impl Default for SurgeSettings {
+    fn default() -> Self {
+        Self {
+            controller: "http://127.0.0.1:6171".into(),
+            secret: String::new(),
+            group: "果到雷达".into(),
+            proxy_port: 7900,
+            node_filter: String::new(),
+            pinned_node: "DIRECT".into(),
+        }
+    }
+}
+
 /// 查询网络设置。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NetworkSettings {
     pub mode: NetworkMode,
     pub clash: ClashSettings,
+    pub backend: ProxyBackend,
+    pub surge: SurgeSettings,
 }
 
 impl NetworkSettings {
+    pub fn proxy_port(&self) -> u16 {
+        match self.backend {
+            ProxyBackend::Clash => self.clash.proxy_port,
+            ProxyBackend::Surge => self.surge.proxy_port,
+        }
+    }
+
+    pub fn group(&self) -> &str {
+        match self.backend {
+            ProxyBackend::Clash => &self.clash.group,
+            ProxyBackend::Surge => &self.surge.group,
+        }
+    }
+
+    pub fn node_filter(&self) -> &str {
+        match self.backend {
+            ProxyBackend::Clash => &self.clash.node_filter,
+            ProxyBackend::Surge => &self.surge.node_filter,
+        }
+    }
+
+    pub fn pinned_node(&self) -> &str {
+        match self.backend {
+            ProxyBackend::Clash => &self.clash.pinned_node,
+            ProxyBackend::Surge => &self.surge.pinned_node,
+        }
+    }
+
+    pub fn controller(&self) -> &str {
+        match self.backend {
+            ProxyBackend::Clash => &self.clash.controller,
+            ProxyBackend::Surge => &self.surge.controller,
+        }
+    }
+
     fn normalize(&mut self) {
         let clash = &mut self.clash;
         clash.controller = clash.controller.trim().trim_end_matches('/').to_string();
@@ -245,6 +325,18 @@ impl NetworkSettings {
         clash.pinned_node = clash.pinned_node.trim().to_string();
         if clash.pinned_node.is_empty() {
             clash.pinned_node = "DIRECT".into();
+        }
+        let surge = &mut self.surge;
+        surge.controller = surge.controller.trim().trim_end_matches('/').to_string();
+        if !surge.controller.is_empty() && !surge.controller.contains("://") {
+            surge.controller = format!("http://{}", surge.controller);
+        }
+        surge.secret = surge.secret.trim().to_string();
+        surge.group = surge.group.trim().to_string();
+        surge.node_filter = surge.node_filter.trim().to_string();
+        surge.pinned_node = surge.pinned_node.trim().to_string();
+        if surge.pinned_node.is_empty() {
+            surge.pinned_node = "DIRECT".into();
         }
     }
 }
@@ -648,7 +740,7 @@ impl SettingsStore {
         let path = self.previous_path.as_ref()?;
         let file = File::open(path).ok()?;
         let data = read_capped(file, MAX_SETTINGS_BYTES).ok()??;
-        let mut settings: Settings = serde_json::from_slice(&data).ok()?;
+        let mut settings = decode_settings(&data).ok()?;
         settings.normalize();
         Some(settings)
     }
@@ -675,11 +767,10 @@ impl SettingsStore {
                 limit: MAX_SETTINGS_BYTES,
             })?;
 
-        let mut settings: Settings =
-            serde_json::from_slice(&data).map_err(|source| ConfigError::Malformed {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut settings = decode_settings(&data).map_err(|source| ConfigError::Malformed {
+            path: self.path.clone(),
+            source,
+        })?;
         settings.normalize();
         Ok(settings)
     }
@@ -771,6 +862,38 @@ impl SettingsStore {
                 Some(legacy.into_settings())
             })
     }
+}
+
+/// 兼容本地旧版的独立重要通知开关；已经使用 barkOptions 的配置始终优先。
+fn decode_settings(data: &[u8]) -> Result<Settings, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_slice(data)?;
+    let legacy_critical = value
+        .get("barkCritical")
+        .and_then(serde_json::Value::as_bool);
+    let legacy_volume = value
+        .get("barkVolume")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(5)
+        .min(10) as u8;
+    let has_bark_options = value.get("barkOptions").is_some();
+    let mut settings: Settings = serde_json::from_slice(data)?;
+    if !has_bark_options && let Some(enabled) = legacy_critical {
+        settings.bark_options.volume = Some(legacy_volume);
+        if enabled {
+            settings.bark_options.level = BarkLevel::Critical;
+        } else {
+            // 原开关关闭时会移除地址中的重要警告参数，迁移后不能意外重新开启。
+            for address in std::iter::once(&mut settings.bark_url)
+                .chain(settings.product_bark_urls.values_mut())
+            {
+                if let Ok(mut url) = reqwest::Url::parse(address) {
+                    crate::notify::apply_bark_critical_alert(&mut url, false, legacy_volume);
+                    *address = url.into();
+                }
+            }
+        }
+    }
+    Ok(settings)
 }
 
 /// 取文件所在目录；路径本身就是个裸文件名时退回当前目录。

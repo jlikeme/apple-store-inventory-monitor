@@ -154,6 +154,7 @@ fn fast_config() -> WatcherConfig {
         concurrency: 4,
         event_buffer: 256,
         delivery_region: None,
+        ..WatcherConfig::default()
     }
 }
 
@@ -1175,4 +1176,182 @@ async fn 业务说明随本轮快照传递且失败后清除() {
         second_row.pickup_details.is_none(),
         "本轮失败不能继续显示上一轮未发售详情"
     );
+}
+
+#[derive(Clone)]
+struct TimeoutFetcher {
+    recovered: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    stall_initialization: bool,
+}
+
+impl TimeoutFetcher {
+    fn new(stall_initialization: bool) -> Self {
+        Self {
+            recovered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicUsize::new(0)),
+            calls: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            stall_initialization,
+        }
+    }
+}
+
+impl Fetcher for TimeoutFetcher {
+    async fn begin_cycle(&self) {
+        if self.stall_initialization && !self.recovered.load(Ordering::SeqCst) {
+            let _guard = InFlightGuard::enter(&self.in_flight, &self.peak);
+            std::future::pending::<()>().await;
+        }
+    }
+
+    async fn pickup_message(
+        &self,
+        _region: &'static Region,
+        store: &str,
+        targets: &[Target],
+        _delivery: Option<&DeliveryRegion>,
+    ) -> Result<StoreAvailability, ApiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let _guard = InFlightGuard::enter(&self.in_flight, &self.peak);
+        if store != "R390" && !self.recovered.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        let parts: Vec<_> = targets
+            .iter()
+            .map(|target| target.part_number.clone())
+            .collect();
+        Ok(ok_response(store, &parts, Availability::OutOfStock))
+    }
+
+    async fn retry_now(&self) {
+        while !self.recovered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn cancel_pending_queries(&self) {
+        assert_eq!(
+            self.in_flight.load(Ordering::SeqCst),
+            0,
+            "先取消查询 future 再清理会话"
+        );
+        self.cancelled.fetch_add(1, Ordering::SeqCst);
+        self.recovered.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn 整轮超时取消卡住和排队的查询并保留已完成结果() {
+    let fake = TimeoutFetcher::new(false);
+    let config = WatcherConfig {
+        query_timeout: Duration::from_millis(60),
+        concurrency: 1,
+        interval: Duration::from_secs(3600),
+        ..fast_config()
+    };
+    let (watcher, mut events) = Watcher::spawn(fake.clone(), config);
+    watcher
+        .set_targets(vec![
+            target("R390", "A"),
+            target("R683", "A"),
+            target("R761", "A"),
+        ])
+        .await;
+    watcher.start().await;
+    let first = wait_cycle(&mut events).await;
+    let snapshot = first
+        .iter()
+        .find_map(|event| match event {
+            Event::CycleComplete {
+                snapshot, healthy, ..
+            } => {
+                assert!(!healthy);
+                Some(snapshot)
+            }
+            _ => None,
+        })
+        .unwrap();
+    for state in snapshot {
+        if state.target.store_number == "R390" {
+            assert_eq!(state.availability, Availability::OutOfStock);
+        } else {
+            assert!(
+                matches!(&state.availability, Availability::Unknown(UnknownReason::Transport { detail }) if detail.contains("查询超时"))
+            );
+        }
+    }
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        2,
+        "排队的门店不能在截止后发起请求"
+    );
+    assert_eq!(fake.cancelled.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.in_flight.load(Ordering::SeqCst), 0);
+    assert!(watcher.retry_now().await);
+    let second = wait_cycle(&mut events).await;
+    assert!(
+        second
+            .iter()
+            .any(|event| matches!(event, Event::CycleComplete { healthy: true, .. }))
+    );
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 5);
+    watcher.stop().await;
+}
+
+#[tokio::test]
+async fn 初始化卡住也会按整轮时限结束() {
+    let fake = TimeoutFetcher::new(true);
+    let config = WatcherConfig {
+        query_timeout: Duration::from_millis(40),
+        interval: Duration::from_secs(3600),
+        ..fast_config()
+    };
+    let (watcher, mut events) = Watcher::spawn(fake.clone(), config);
+    watcher.set_targets(vec![target("R390", "A")]).await;
+    watcher.start().await;
+    let first = wait_cycle(&mut events).await;
+    assert!(first.iter().any(|event| matches!(event, Event::CycleComplete { healthy: false, snapshot, .. } if snapshot[0].availability.describe_reason().is_some_and(|message| message.contains("查询超时")))));
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.cancelled.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.in_flight.load(Ordering::SeqCst), 0);
+    watcher.stop().await;
+}
+
+#[tokio::test]
+async fn 初始化卡住时立即重试也不能阻塞查询超时() {
+    let fake = TimeoutFetcher::new(true);
+    let config = WatcherConfig {
+        query_timeout: Duration::from_millis(60),
+        interval: Duration::from_secs(3600),
+        ..fast_config()
+    };
+    let (watcher, mut events) = Watcher::spawn(fake.clone(), config);
+    watcher.set_targets(vec![target("R390", "A")]).await;
+    watcher.start().await;
+    loop {
+        if matches!(events.recv().await.unwrap(), Event::CycleStarted { .. }) {
+            break;
+        }
+    }
+    let retry_watcher = watcher.clone();
+    let retry = tokio::spawn(async move { retry_watcher.retry_now().await });
+    let completed = wait_cycle(&mut events).await;
+    assert!(
+        completed
+            .iter()
+            .any(|event| matches!(event, Event::CycleComplete { healthy: false, .. }))
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    assert_eq!(fake.cancelled.load(Ordering::SeqCst), 1);
+    watcher.stop().await;
 }

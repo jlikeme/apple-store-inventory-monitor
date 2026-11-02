@@ -118,6 +118,7 @@ fn 样例设置() -> Settings {
                 node_filter: "香港|日本".into(),
                 pinned_node: "DIRECT".into(),
             },
+            ..NetworkSettings::default()
         },
         checkout: CheckoutSettings {
             enabled: true,
@@ -614,6 +615,15 @@ fn 设置的线上格式是小驼峰() {
         obj.get("network"),
         Some(&serde_json::json!({
             "mode": "clash",
+            "backend": "clash",
+            "surge": {
+                "controller": "http://127.0.0.1:6171",
+                "secret": "",
+                "group": "果到雷达",
+                "proxyPort": 7900,
+                "nodeFilter": "",
+                "pinnedNode": "DIRECT"
+            },
             "clash": {
                 "controller": "http://127.0.0.1:9097",
                 "secret": "s3cret",
@@ -738,6 +748,7 @@ fn 线路设置规范化去掉空白与控制地址结尾斜杠() {
                 node_filter: " 香港|日本 ".into(),
                 pinned_node: "  ".into(),
             },
+            ..NetworkSettings::default()
         },
         ..Settings::default()
     };
@@ -927,4 +938,127 @@ fn 其他地区的监控项不会触发自动结账() {
     settings.normalize();
     assert_eq!(settings.checkout_product(), None);
     assert!(!settings.checkout.enabled);
+}
+
+#[test]
+fn 旧线路配置缺少后端时保留clash设置() {
+    use apw_core::config::{ProxyBackend, SurgeSettings};
+    for mode in ["system", "pinned", "clash"] {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "network": {"mode":mode, "clash": {
+                "controller":"http://127.0.0.1:9000", "secret":"old-key",
+                "group":"旧策略组", "proxyPort":7898, "nodeFilter":"香港", "pinnedNode":"香港01"
+            }}
+        }))
+        .unwrap();
+        assert_eq!(settings.network.backend, ProxyBackend::Clash);
+        assert_eq!(settings.network.clash.secret, "old-key");
+        assert_eq!(settings.network.clash.proxy_port, 7898);
+        assert_eq!(settings.network.clash.pinned_node, "香港01");
+        assert_eq!(settings.network.surge, SurgeSettings::default());
+    }
+}
+
+#[test]
+fn surge规范化与配置往返不覆盖clash设置() {
+    use apw_core::config::ProxyBackend;
+    let mut settings = 样例设置();
+    let clash = settings.network.clash.clone();
+    settings.network.backend = ProxyBackend::Surge;
+    settings.network.surge.controller = " 127.0.0.1:6171/ ".into();
+    settings.network.surge.secret = " surge-key ".into();
+    settings.network.surge.group = " 专用组 ".into();
+    settings.network.surge.pinned_node = " ".into();
+    settings.normalize();
+    assert_eq!(settings.network.controller(), "http://127.0.0.1:6171");
+    assert_eq!(settings.network.surge.secret, "surge-key");
+    assert_eq!(settings.network.group(), "专用组");
+    assert_eq!(settings.network.pinned_node(), "DIRECT");
+    assert_eq!(settings.network.proxy_port(), 7900);
+    let mut decoded: Settings =
+        serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert_eq!(decoded, settings);
+    decoded.network.backend = ProxyBackend::Clash;
+    assert_eq!(decoded.network.clash, clash);
+    assert_eq!(decoded.network.proxy_port(), 7899);
+}
+
+#[test]
+fn 未指定bark选项的配置保持默认行为() {
+    let settings: Settings =
+        serde_json::from_str(r#"{"barkUrl":"https://example.invalid/key"}"#).unwrap();
+    assert_eq!(settings.bark_options, BarkOptions::default());
+    assert_eq!(settings.bark_url, "https://example.invalid/key");
+}
+
+#[test]
+fn 旧bark重要通知配置迁移并持久化到新字段() {
+    let dir = 临时目录::new("bark-options-migration");
+    let path = dir.设置路径();
+    let store = SettingsStore::at(path.clone());
+    for (volume, expected) in [(0, 0), (8, 8), (255, 10)] {
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "barkCritical": true, "barkVolume": volume,
+                "network": {"backend": "surge", "surge": {"proxyPort": 7901}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let settings = store.load().unwrap();
+        assert_eq!(settings.bark_options.level, BarkLevel::Critical);
+        assert_eq!(settings.bark_options.volume, Some(expected));
+        assert_eq!(settings.network.proxy_port(), 7901);
+        store.save(&settings).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("barkCritical").is_none());
+        assert!(saved.get("barkVolume").is_none());
+        assert_eq!(store.load().unwrap(), settings);
+    }
+}
+
+#[test]
+fn 迁移关闭的重要通知时保留普通等级和其他地址参数() {
+    let dir = 临时目录::new("bark-disabled-migration");
+    let path = dir.设置路径();
+    fs::write(&path, serde_json::to_vec(&serde_json::json!({
+        "barkCritical": false, "barkVolume": 7,
+        "barkUrl": "https://example.invalid/key?level=critical&volume=10&group=a;b&sound=alarm&%zz=1",
+        "targets": [目标("R683", "MG724CH/A")],
+        "productBarkUrls": {"MG724CH/A": "https://example.invalid/friend?level=passive&volume=8&group=stock"}
+    })).unwrap()).unwrap();
+    let store = SettingsStore::at(path);
+    let settings = store.load().unwrap();
+    assert_eq!(settings.bark_options.level, BarkLevel::Default);
+    assert_eq!(settings.bark_options.volume, Some(7));
+    assert_eq!(
+        settings.bark_url,
+        "https://example.invalid/key?group=a;b&sound=alarm&%zz=1"
+    );
+    assert_eq!(
+        settings.product_bark_urls["MG724CH/A"],
+        "https://example.invalid/friend?level=passive&group=stock"
+    );
+    store.save(&settings).unwrap();
+    assert_eq!(store.load().unwrap(), settings);
+}
+
+#[test]
+fn 新bark选项优先于残留旧开关且旧开关默认音量为五() {
+    let dir = 临时目录::new("bark-options-precedence");
+    let path = dir.设置路径();
+    let store = SettingsStore::at(path.clone());
+    fs::write(&path, br#"{"barkCritical":true}"#).unwrap();
+    assert_eq!(store.load().unwrap().bark_options.volume, Some(5));
+    fs::write(&path, br#"{"barkCritical":true,"barkVolume":9,"barkOptions":{"level":"passive","sound":"alarm","volume":0,"call":true}}"#).unwrap();
+    assert_eq!(
+        store.load().unwrap().bark_options,
+        BarkOptions {
+            level: BarkLevel::Passive,
+            sound: "alarm".into(),
+            volume: Some(0),
+            call: true
+        }
+    );
 }

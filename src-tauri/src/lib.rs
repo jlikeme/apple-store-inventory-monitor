@@ -28,7 +28,9 @@ mod checkout;
 mod checkout_login;
 mod chromium_fetcher;
 mod clash;
+mod proxy_controller;
 mod route_pool;
+mod surge;
 #[cfg(windows)]
 mod windows_chromium;
 use checkout::{CheckoutOutcome, CheckoutPlan, CheckoutRunner};
@@ -566,7 +568,7 @@ fn catalog_http(state: &AppState) -> reqwest::Client {
     if network.mode == apw_core::config::NetworkMode::System {
         return state.http.clone();
     }
-    reqwest::Proxy::all(format!("http://127.0.0.1:{}", network.clash.proxy_port))
+    reqwest::Proxy::all(format!("http://127.0.0.1:{}", network.proxy_port()))
         .and_then(|proxy| reqwest::Client::builder().proxy(proxy).build())
         .unwrap_or_else(|_| state.http.clone())
 }
@@ -734,6 +736,7 @@ async fn test_clash_route(clash: ClashSettings) -> Result<ClashRouteCheck, Strin
     let mut network = apw_core::config::NetworkSettings {
         mode: apw_core::config::NetworkMode::Clash,
         clash,
+        ..Default::default()
     };
     let mut settings = Settings {
         network: network.clone(),
@@ -756,7 +759,7 @@ async fn test_clash_route(clash: ClashSettings) -> Result<ClashRouteCheck, Strin
     };
     let port_open = tokio::time::timeout(
         Duration::from_secs(2),
-        tokio::net::TcpStream::connect(("127.0.0.1", network.clash.proxy_port)),
+        tokio::net::TcpStream::connect(("127.0.0.1", network.proxy_port())),
     )
     .await
     .is_ok_and(|connected| connected.is_ok());
@@ -766,6 +769,118 @@ async fn test_clash_route(clash: ClashSettings) -> Result<ClashRouteCheck, Strin
         port_open,
         timeout_count,
     })
+}
+
+/// Backend-neutral route check. An open port alone does not establish that
+/// the listener belongs to Surge or that IN-PORT points at the dedicated group.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyRouteCheck {
+    backend: apw_core::config::ProxyBackend,
+    version: String,
+    #[serde(flatten)]
+    group: clash::GroupNodes,
+    port_open: bool,
+    timeout_count: usize,
+    slow_count: usize,
+    probe_error: Option<String>,
+    route_verified: bool,
+}
+
+#[tauri::command]
+async fn test_proxy_route(
+    network: apw_core::config::NetworkSettings,
+) -> Result<ProxyRouteCheck, String> {
+    let mut settings = Settings {
+        network,
+        ..Settings::default()
+    };
+    settings.normalize();
+    let network = settings.network;
+    let controller = proxy_controller::ProxyController::new(&network)?;
+    let version = controller.version().await?;
+    let group = controller
+        .group_nodes(network.group(), network.node_filter())
+        .await?;
+    if group.nodes.is_empty() {
+        return Err("专用策略组里没有可用于查询的节点".into());
+    }
+    let probes = controller.group_probes(network.group(), &group.nodes).await;
+    let timeout_count = probes
+        .as_ref()
+        .map(|probes| {
+            group
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.as_str() != "DIRECT"
+                        && probes.get(*node).is_some_and(|probe| !probe.reachable)
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    let slow_count = probes
+        .as_ref()
+        .map(|probes| {
+            group
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.as_str() != "DIRECT"
+                        && probes.get(*node).is_some_and(|probe| probe.too_slow())
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    let port_open = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(("127.0.0.1", network.proxy_port())),
+    )
+    .await
+    .is_ok_and(|connected| connected.is_ok());
+    Ok(ProxyRouteCheck {
+        backend: network.backend,
+        version,
+        group,
+        port_open,
+        timeout_count,
+        slow_count,
+        probe_error: probes.err(),
+        route_verified: false,
+    })
+}
+
+#[tauri::command]
+async fn get_proxy_node(
+    network: apw_core::config::NetworkSettings,
+) -> Result<Option<String>, String> {
+    let mut settings = Settings {
+        network,
+        ..Settings::default()
+    };
+    settings.normalize();
+    let network = settings.network;
+    // Read directly, rather than waiting on the query browser's mutex or its
+    // cached route. This also follows selections made in the proxy application.
+    proxy_controller::ProxyController::new(&network)?
+        .current_node(network.group())
+        .await
+}
+
+#[tauri::command]
+async fn list_proxy_nodes(
+    state: tauri::State<'_, AppState>,
+) -> Result<chromium_fetcher::RouteList, String> {
+    state.fetcher.list_routes().await
+}
+
+#[tauri::command]
+async fn select_proxy_node(
+    state: tauri::State<'_, AppState>,
+    node: String,
+    backend: apw_core::config::ProxyBackend,
+) -> Result<proxy_controller::NodeProbe, String> {
+    state.fetcher.select_route_probe(&node, Some(backend)).await
 }
 
 #[tauri::command]
@@ -1749,6 +1864,10 @@ pub fn run() {
             refresh_products,
             get_settings,
             save_settings,
+            test_proxy_route,
+            get_proxy_node,
+            list_proxy_nodes,
+            select_proxy_node,
             test_clash_route,
             list_clash_nodes,
             select_clash_node,
@@ -1987,5 +2106,64 @@ mod tests {
         let parsed = parse_watch_band_sizes(sizes.as_bytes()).expect("应当解析表带尺码");
         assert_eq!(parsed[0].text, "6");
         assert_eq!(parsed[0].part_number, "MKJP4FE/A");
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn surge线路检查不把其他程序的监听端口当成路由验证成功() {
+        let (surge, _) = crate::surge::tests::fake_surge(&["DIRECT", "香港01"], "DIRECT").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut network = apw_core::config::NetworkSettings {
+            backend: apw_core::config::ProxyBackend::Surge,
+            surge,
+            ..Default::default()
+        };
+        network.surge.proxy_port = port;
+        let check = super::test_proxy_route(network.clone()).await.unwrap();
+        assert!(check.port_open);
+        assert!(!check.route_verified);
+        drop(listener);
+        assert!(!super::test_proxy_route(network).await.unwrap().port_open);
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn 读取surge当前节点跟随外部切换且不会测速() {
+        let (surge, server) =
+            crate::surge::tests::fake_surge(&["香港01", "日本01"], "香港01").await;
+        let network = apw_core::config::NetworkSettings {
+            mode: apw_core::config::NetworkMode::Clash,
+            backend: apw_core::config::ProxyBackend::Surge,
+            surge,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::get_proxy_node(network.clone())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("香港01")
+        );
+        server.lock().await.selected = "日本01".into();
+        assert_eq!(
+            super::get_proxy_node(network.clone())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("日本01")
+        );
+        let calls = server.lock().await.calls.clone();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls.iter().all(|(method, path, _)| method == "GET"
+                && path.starts_with("/v1/policy_groups/select?"))
+        );
+        let mut invalid = network;
+        invalid.surge.secret = "wrong".into();
+        assert!(
+            super::get_proxy_node(invalid)
+                .await
+                .unwrap_err()
+                .contains("密钥")
+        );
     }
 }

@@ -1223,6 +1223,8 @@ export default function App() {
                   </div>
                 </div>
 
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">每轮查询限时 60 秒；超时会结束未完成请求，并按查询间隔重试。</p>
+
                 <div className="mt-3 field-group">
                   <div className="flex items-center justify-between gap-3">
                     <Label className="control-label">

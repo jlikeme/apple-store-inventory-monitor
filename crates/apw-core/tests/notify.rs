@@ -594,3 +594,124 @@ async fn 内嵌提示音能真的响一声且并发调用不叠加() {
         "两次并发调用不该叠加播放：{elapsed:?}"
     );
 }
+
+#[tokio::test]
+async fn bark重要通知发送音量并保留原始分组铃声和跳转() {
+    let server = TestServer::ok();
+    let base = format!(
+        "{}?group=a;b&sound=alarm&%zz=1&level=passive&volume=1&le%76el=active&vol%75me=2",
+        server.base_url()
+    );
+    Bark::new(base, client())
+        .with_critical_alert(true, 8)
+        .notify(&到货通知())
+        .await
+        .unwrap();
+    let target = server.target();
+    assert!(
+        target.contains("group=a;b&sound=alarm&%zz=1"),
+        "必须原样保留自定义参数"
+    );
+    let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+    let pairs: Vec<_> = url.query_pairs().collect();
+    assert_eq!(pairs.iter().filter(|(key, _)| key == "level").count(), 1);
+    assert_eq!(
+        pairs.iter().find(|(key, _)| key == "level").unwrap().1,
+        "critical"
+    );
+    assert_eq!(pairs.iter().filter(|(key, _)| key == "volume").count(), 1);
+    assert_eq!(
+        pairs.iter().find(|(key, _)| key == "volume").unwrap().1,
+        "8"
+    );
+    assert_eq!(
+        pairs.iter().find(|(key, _)| key == "url").unwrap().1,
+        "https://www.apple.com.cn/shop/bag?step=1&next=2"
+    );
+}
+
+#[tokio::test]
+async fn bark关闭重要通知会去掉地址里的critical和音量() {
+    let server = TestServer::ok();
+    Bark::new(
+        format!(
+            "{}?level=critical&volume=10&le%76el=critical&group=stock&sound=alarm",
+            server.base_url()
+        ),
+        client(),
+    )
+    .with_critical_alert(false, 9)
+    .notify(&到货通知())
+    .await
+    .unwrap();
+    let url = reqwest::Url::parse(&format!("http://localhost{}", server.target())).unwrap();
+    assert!(
+        !url.query_pairs()
+            .any(|(key, _)| key == "level" || key == "volume")
+    );
+    assert!(
+        url.query_pairs()
+            .any(|(key, value)| key == "group" && value == "stock")
+    );
+    assert!(
+        url.query_pairs()
+            .any(|(key, value)| key == "sound" && value == "alarm")
+    );
+}
+
+#[tokio::test]
+async fn bark关闭重要通知保留用户其他通知级别() {
+    for level in ["active", "timeSensitive", "passive"] {
+        let server = TestServer::ok();
+        Bark::new(
+            format!("{}?level={level}&volume=8", server.base_url()),
+            client(),
+        )
+        .with_critical_alert(false, 5)
+        .notify(&到货通知())
+        .await
+        .unwrap();
+        let url = reqwest::Url::parse(&format!("http://localhost{}", server.target())).unwrap();
+        assert!(
+            url.query_pairs()
+                .any(|(key, value)| key == "level" && value == level)
+        );
+        assert!(!url.query_pairs().any(|(key, _)| key == "volume"));
+    }
+}
+
+#[tokio::test]
+async fn bark重要通知保留零音量并限制最高音量() {
+    for (volume, expected) in [(0, "0"), (10, "10"), (255, "10")] {
+        let server = TestServer::ok();
+        Bark::new(server.base_url(), client())
+            .with_critical_alert(true, volume)
+            .notify(&到货通知())
+            .await
+            .unwrap();
+        let url = reqwest::Url::parse(&format!("http://localhost{}", server.target())).unwrap();
+        assert!(
+            url.query_pairs()
+                .any(|(key, value)| key == "volume" && value == expected)
+        );
+        assert!(
+            url.query_pairs()
+                .any(|(key, value)| key == "level" && value == "critical")
+        );
+    }
+}
+
+#[tokio::test]
+async fn bark普通通知默认不附加重要通知参数() {
+    let server = TestServer::ok();
+    Bark::new(server.base_url(), client())
+        .with_critical_alert(false, 5)
+        .notify(&到货通知())
+        .await
+        .unwrap();
+    let url = reqwest::Url::parse(&format!("http://localhost{}", server.target())).unwrap();
+    assert!(
+        !url.query_pairs()
+            .any(|(key, _)| key == "level" || key == "volume")
+    );
+}

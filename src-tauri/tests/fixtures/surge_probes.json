@@ -1,0 +1,16 @@
+{
+  "新加坡01": {
+    "tfo": false,
+    "tcp": 26,
+    "receive": 103,
+    "available": 35,
+    "round-one-total": 215
+  },
+  "香港01": {
+    "tfo": false,
+    "tcp": 357,
+    "receive": 125,
+    "available": 452,
+    "round-one-total": 585
+  }
+}

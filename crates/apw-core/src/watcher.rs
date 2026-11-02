@@ -41,6 +41,10 @@ use crate::model::{
 /// 发请求之前分批，不能把被静默截断的型号长期留在「未返回」状态。
 pub const MAX_PARTS_PER_REQUEST: usize = 20;
 
+/// One deadline covers warm-up, queued stores, route attempts and delivery.
+pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+const QUERY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// 单个监控目标的当前状态。
 ///
 /// 注意这里**没有**独立的 `last_error` 字段：原因就装在
@@ -151,6 +155,8 @@ pub struct WatcherConfig {
     pub jitter: f64,
     /// 同一轮内并发查询的门店数上限。
     pub concurrency: usize,
+    /// 全部查询单元共享的单轮时限，包含排队和查询器初始化。
+    pub query_timeout: Duration,
     /// 事件通道容量。
     pub event_buffer: usize,
     pub delivery_region: Option<DeliveryRegion>,
@@ -162,6 +168,7 @@ impl Default for WatcherConfig {
             interval: Duration::from_secs(30),
             jitter: 0.0,
             concurrency: 4,
+            query_timeout: DEFAULT_QUERY_TIMEOUT,
             event_buffer: 256,
             delivery_region: None,
         }
@@ -360,10 +367,24 @@ async fn run_queries<F: Fetcher>(
     groups: Vec<StoreGroup>,
     concurrency: usize,
     delivery_region: Option<DeliveryRegion>,
+    query_timeout: Duration,
 ) -> Vec<StoreOutcome> {
-    client.begin_cycle().await;
-    let query_targets: Vec<_> = groups.iter().map(|group| group.targets.clone()).collect();
-    client.plan_cycle(&query_targets).await;
+    let deadline = tokio::time::Instant::now() + query_timeout;
+    let initialization = async {
+        client.begin_cycle().await;
+        let query_targets: Vec<_> = groups.iter().map(|group| group.targets.clone()).collect();
+        client.plan_cycle(&query_targets).await;
+    };
+    if tokio::time::timeout_at(deadline, initialization)
+        .await
+        .is_err()
+    {
+        cancel_timed_out_queries(&client).await;
+        return groups
+            .iter()
+            .map(|group| timed_out_store(group, query_timeout))
+            .collect();
+    }
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut set = JoinSet::new();
 
@@ -376,17 +397,28 @@ async fn run_queries<F: Fetcher>(
             .then(|| delivery_region.clone())
             .flatten();
         set.spawn(async move {
-            // 拿不到许可只可能是信号量被关闭，这里不会发生；真发生了也只是
-            // 少查一个门店，不该让整轮崩掉。
-            let _permit = sem.acquire_owned().await;
-            query_one_store(&client, group, delivery_region.as_ref()).await
+            let timeout_group = group.clone();
+            let query = async {
+                let _permit = sem.acquire_owned().await;
+                query_one_store(&client, group, delivery_region.as_ref()).await
+            };
+            tokio::select! {
+                // Expired queued stores must not start another request.
+                biased;
+                _ = tokio::time::sleep_until(deadline) => (true, timed_out_store(&timeout_group, query_timeout)),
+                outcome = query => (false, outcome),
+            }
         });
     }
 
     let mut outcomes = Vec::new();
+    let mut timed_out = false;
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok(outcome) => outcomes.push(outcome),
+            Ok((expired, outcome)) => {
+                timed_out |= expired;
+                outcomes.push(outcome);
+            }
             Err(err) => {
                 // 子任务 panic 了。Rust 不像 Go 那样会带走整个进程，但绝不能
                 // 当作没发生 —— 这些目标的状态必须被标成未知，否则它们会停在
@@ -408,7 +440,48 @@ async fn run_queries<F: Fetcher>(
             }
         }
     }
+    if timed_out {
+        // Every query future (and its mutex guard) has now been dropped. The
+        // browser itself must also stop, so cancelled JS fetches cannot linger.
+        cancel_timed_out_queries(&client).await;
+    }
     outcomes
+}
+
+async fn cancel_timed_out_queries<F: Fetcher>(client: &F) {
+    if tokio::time::timeout(QUERY_CLEANUP_TIMEOUT, client.cancel_pending_queries())
+        .await
+        .is_err()
+    {
+        eprintln!("库存查询超时后的会话清理未及时完成，下次查询将检查失效会话");
+    }
+}
+
+fn timed_out_store(group: &StoreGroup, timeout: Duration) -> StoreOutcome {
+    let reason = UnknownReason::Transport {
+        detail: format!(
+            "本轮库存查询超时（{} 秒），未完成请求已取消，将按查询间隔重试",
+            timeout.as_secs_f64()
+        ),
+    };
+    StoreOutcome {
+        locale: group.locale.clone(),
+        store_number: group.store_number.clone(),
+        parts: group
+            .targets
+            .iter()
+            .map(|target| {
+                (
+                    target.part_number.clone(),
+                    Availability::Unknown(reason.clone()),
+                    None,
+                )
+            })
+            .collect(),
+        ok: false,
+        problems: group.targets.len(),
+        trouble: None,
+    }
 }
 
 async fn query_one_store<F: Fetcher>(
@@ -645,6 +718,7 @@ impl<F: Fetcher> Engine<F> {
                 groups,
                 self.config.concurrency,
                 self.config.delivery_region.clone(),
+                self.config.query_timeout,
             );
             tokio::pin!(queries);
 
@@ -660,6 +734,15 @@ impl<F: Fetcher> Engine<F> {
                             let _ = reply.send(());
                             break None;
                         }
+                        Some(Command::RetryNow(reply)) => {
+                            // Keep polling the query deadline while retry waits
+                            // for the browser mutex held by that query.
+                            let client = self.client.clone();
+                            tokio::spawn(async move {
+                                client.retry_now().await;
+                                let _ = reply.send(true);
+                            });
+                        }
                         Some(cmd) => self.handle_command(cmd).await,
                         None => return,
                     },
@@ -670,8 +753,13 @@ impl<F: Fetcher> Engine<F> {
                 continue;
             };
 
-            let stats = self.client.cycle_stats().await;
-            let schedule_hint = self.client.schedule_hint(&locales).await;
+            let stats = tokio::time::timeout(QUERY_CLEANUP_TIMEOUT, self.client.cycle_stats())
+                .await
+                .unwrap_or_default();
+            let schedule_hint =
+                tokio::time::timeout(QUERY_CLEANUP_TIMEOUT, self.client.schedule_hint(&locales))
+                    .await
+                    .unwrap_or_default();
 
             // 写状态之前先把已经排队的命令处理掉。
             //
@@ -883,6 +971,7 @@ impl<F: Fetcher> Engine<F> {
         let mut ok = 0usize;
         let mut problems = 0usize;
         let now = now_ms();
+        let cache_deadline = tokio::time::Instant::now() + QUERY_CLEANUP_TIMEOUT;
 
         for outcome in outcomes {
             if outcome.ok {
@@ -908,10 +997,12 @@ impl<F: Fetcher> Engine<F> {
                     continue;
                 };
 
-                if let Some(delivery) = self
-                    .client
-                    .cached_delivery(&state.target, self.config.delivery_region.as_ref())
-                    .await
+                if let Ok(Some(delivery)) = tokio::time::timeout_at(
+                    cache_deadline,
+                    self.client
+                        .cached_delivery(&state.target, self.config.delivery_region.as_ref()),
+                )
+                .await
                 {
                     delivery.merge_into(&mut pickup_details);
                 }
@@ -952,10 +1043,12 @@ impl<F: Fetcher> Engine<F> {
                 });
                 let previous = std::mem::replace(&mut state.availability, unknown);
                 state.pickup_details = None;
-                if let Some(delivery) = self
-                    .client
-                    .cached_delivery(&state.target, self.config.delivery_region.as_ref())
-                    .await
+                if let Ok(Some(delivery)) = tokio::time::timeout_at(
+                    cache_deadline,
+                    self.client
+                        .cached_delivery(&state.target, self.config.delivery_region.as_ref()),
+                )
+                .await
                 {
                     delivery.merge_into(&mut state.pickup_details);
                 }
